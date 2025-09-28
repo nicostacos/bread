@@ -1,20 +1,21 @@
 import sys
 import discord
-from discord.ext import commands
-from discord import app_commands
 import logging
-from dotenv import load_dotenv
 import os
 import random
 import datetime
 import asyncio
 import threading
-from flask import Flask
 import aiohttp
 import asyncio
-from pymongo import MongoClient  # ✅ MongoDB import
-from webhook_utils import send_webhook_message
-from datetime import datetime, timezone  # ensure this import is present
+from pymongo import MongoClient
+# from webhook_utils import send_webhook_message
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+from discord import app_commands
+from discord.ext import commands
+from flask import Flask
+
 
 # --- MongoDB Setup
 
@@ -64,7 +65,6 @@ default_filter_words = [
     "nigguh",
     "nigguhs",
     "dick",
-    "gay",
 ]
 
 print("✅ Connected to MongoDB:", db.name)
