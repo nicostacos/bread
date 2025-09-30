@@ -644,6 +644,21 @@ async def unban(
         await interaction.response.send_message(
             f"✅ {user.name} has been unbanned!\nReason: {reason}"
         )
+        # Log the unban to mod logs
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="🔓 Member Unbanned",
+                description=f"{user.mention} was unbanned by {interaction.user.mention}",
+                color=0x00FF00,
+                fields=[
+                    ("User", f"{user} ({user.id})", False),
+                    ("Moderator", interaction.user.mention, True),
+                    ("Reason", reason, True),
+                ],
+            )
+        except Exception:
+            pass
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to unban this user!", ephemeral=True
@@ -912,7 +927,7 @@ async def broadcast(
             f"✅ Broadcasted message to {channel_count} channels {ping_status}!",
             ephemeral=True,
         )
-        # Log the broadcast to mod logs (if configured)
+        # Log the broadcast to mod logs (non-fatal)
         try:
             await send_mod_log(
                 guild=interaction.guild,
@@ -944,10 +959,31 @@ async def set_welcome_channel(
 ):
     """Set the welcome channel for new members (slash command)"""
     global WELCOME_CHANNEL_ID
+    # Persist welcome channel to DB (non-fatal)
+    try:
+        save_config(guild_id=interaction.guild.id, welcome_channel=channel.id)
+    except Exception:
+        pass
+
     WELCOME_CHANNEL_ID = channel.id
     await interaction.response.send_message(
         f"✅ Welcome channel set to {channel.mention}", ephemeral=True
     )
+
+    # Log the change to mod logs (non-fatal)
+    try:
+        await send_mod_log(
+            guild=interaction.guild,
+            title="🎉 Welcome Channel Set",
+            description=f"Welcome channel set to {channel.mention} by {interaction.user.mention}",
+            color=0x00FF00,
+            fields=[
+                ("Channel", channel.mention, True),
+                ("Moderator", interaction.user.mention, True),
+            ],
+        )
+    except Exception:
+        pass
 
 
 async def send_mod_log(
@@ -1479,6 +1515,22 @@ async def broadcast(ctx, *, message):
             f"✅ Broadcasted message to {channel_count} channels {ping_status}!",
             delete_after=5,
         )
+        # Log the broadcast to mod logs (non-fatal)
+        try:
+            await send_mod_log(
+                guild=ctx.guild,
+                title="📣 Broadcast Sent",
+                description=f"Broadcast sent by {ctx.author.mention} to {channel_count} channels ({ping_status}).",
+                color=0xF1C40F,
+                fields=[
+                    ("Moderator", ctx.author.mention, True),
+                    ("Channels Sent", str(channel_count), True),
+                    ("Ping Status", ping_status, True),
+                    ("Message", (message[:1024] + '...') if len(message) > 1024 else message, False),
+                ],
+            )
+        except Exception:
+            pass
     except Exception as e:
         await ctx.send(f"❌ An error occurred: {e}")
 
@@ -1519,6 +1571,20 @@ async def set_channel(
             response += f"- Welcome Channel: {welcome_channel.mention}"
 
         await interaction.response.send_message(response, ephemeral=True)
+        # Log the configuration change to mod logs (non-fatal)
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="⚙️ Channel Configuration Updated",
+                description=f"Log channel: {('<#'+str(new_log)+'>' ) if new_log else 'Not set'}, Welcome channel: {('<#'+str(new_welcome)+'>' ) if new_welcome else 'Not set'}",
+                color=0x00FF00,
+                fields=[
+                    ("Log Channel", (log_channel.mention if log_channel else (f'<#{current_log}>' if current_log else 'Not set')), True),
+                    ("Welcome Channel", (welcome_channel.mention if welcome_channel else (f'<#{current_welcome}>' if current_welcome else 'Not set')), True),
+                ],
+            )
+        except Exception:
+            pass
 
     except Exception as e:
         await interaction.response.send_message(
@@ -1784,7 +1850,7 @@ async def help(ctx, *, command_name=None):
     # Create main help embed
     embed = discord.Embed(
         title="🍞 Bread Bot - Command Reference",
-        description="**Available Commands** • Use `bread help <command>` for detailed info",
+        description="**Available Commands** • Use `bread help <command>` to for detailed info",
         color=0x00FF00,
     )
 
@@ -2071,7 +2137,7 @@ async def slash_help(interaction: discord.Interaction, command: str = None):
             "broadcast": {
                 "description": "Send a message to all channels in the server",
                 "usage": "`/broadcast message:<text> [ping:<true/false>]` or `bread broadcast [message]`",
-                "example": "`/broadcast message:Server restart in 5 minutes ping:true`\n`bread broadcast ping Server restart in 5 minutes`",
+                               "example": "`/broadcast message:Server restart in 5 minutes ping:true`\n`bread broadcast ping Server restart in 5 minutes`",
             },
         }.get(command.lower())
 
@@ -2112,6 +2178,7 @@ async def slash_help(interaction: discord.Interaction, command: str = None):
             )
 
         await interaction.response.send_message(embed=embed)
+
         return
 
     # Main help command (no specific command requested)
@@ -2122,10 +2189,7 @@ async def slash_help(interaction: discord.Interaction, command: str = None):
     )
 
     # Add bot avatar
-    if interaction.guild and interaction.guild.me.avatar:
-        embed.set_thumbnail(url=interaction.guild.me.avatar.url)
-    elif interaction.client.user.avatar:
-        embed.set_thumbnail(url=interaction.client.user.avatar.url)
+    embed.set_thumbnail(url=interaction.guild.me.avatar.url)
 
     # General Commands (always visible)
     general_commands = [
@@ -2179,15 +2243,15 @@ async def slash_help(interaction: discord.Interaction, command: str = None):
             ("/unmute @user [reason] | bread unmute @user [reason]", "Unmute a member"),
             (
                 "/purge [amount] [reason] | bread purge [amount] [reason]",
-                "Delete messages (default: 10, max: 100)",
+                "Delete messages (default: 10, max: 2000)",
             ),
             (
                 "/lock [#channel] [reason] | bread lock [#channel] [reason]",
-                "Lock a channel (current channel if none specified)",
+                "Lock a channel (default: current)",
             ),
             (
                 "/unlock [#channel] [reason] | bread unlock [#channel] [reason]",
-                "Unlock a channel (current channel if none specified)",
+                "Unlock a channel",
             ),
         ]
 
@@ -2223,7 +2287,7 @@ async def slash_help(interaction: discord.Interaction, command: str = None):
         ]
 
         # Format admin commands
-        admin_text = "\n".join([f"`{cmd}` - {desc}" for cmd, desc in admin_commands])
+        admin_text = "\n".join([f"`bread {cmd}` - {desc}" for cmd, desc in admin_commands])
 
         # Add admin commands section
         embed.add_field(name="⚙️ Admin Commands", value=admin_text, inline=False)
@@ -2264,7 +2328,20 @@ async def setwelcome(ctx, channel: discord.TextChannel = None):
 
     global WELCOME_CHANNEL_ID
     WELCOME_CHANNEL_ID = channel.id
-    await ctx.send(f"✅ Welcome channel set to {channel.mention}")
+    # Log the change to mod logs (non-fatal)
+    try:
+        await send_mod_log(
+            guild=ctx.guild,
+            title="🎉 Welcome Channel Set",
+            description=f"Welcome channel set to {channel.mention} by {ctx.author.mention}",
+            color=0x00FF00,
+            fields=[
+                ("Channel", channel.mention, True),
+                ("Moderator", ctx.author.mention, True),
+            ],
+        )
+    except Exception:
+        pass
 
 
 @bot.command()
@@ -2346,11 +2423,6 @@ async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
                 ("Target", f"{member} ({member.id})", True),
             ],
         )
-
-    except discord.Forbidden:
-        await ctx.send("❌ I don't have permission to ban this member!")
-    except Exception as e:
-        await ctx.send(f"❌ An error occurred: {e}")
 
 
 @bot.tree.command(name="status", description="Show bot status and statistics")
@@ -2646,6 +2718,22 @@ async def lock(
 
         await interaction.response.send_message(embed=embed)
 
+        # Log the channel lock to mod logs
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="🔒 Channel Locked",
+                description=f"{target_channel.mention} was locked by {interaction.user.mention}",
+                color=0xFF0000,
+                fields=[
+                    ("Channel", target_channel.mention, True),
+                    ("Moderator", interaction.user.mention, True),
+                    ("Reason", reason or "No reason provided", False),
+                ],
+            )
+        except Exception:
+            pass
+
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to modify this channel!", ephemeral=True
@@ -2740,13 +2828,27 @@ async def unban(ctx, user: discord.User, *, reason="No reason provided"):
     try:
         await ctx.guild.unban(user, reason=reason)
         await ctx.send(f"✅ {user.mention} has been unbanned!\nReason: {reason}")
+        # Log the unban to mod logs
+        try:
+            await send_mod_log(
+                guild=ctx.guild,
+                title="🔓 Member Unbanned",
+                description=f"{user.mention} was unbanned by {ctx.author.mention}",
+                color=0x00FF00,
+                fields=[
+                    ("User", f"{user} ({user.id})", False),
+                    ("Moderator", ctx.author.mention, True),
+                    ("Reason", reason, True),
+                ],
+            )
+        except Exception:
+            pass
     except discord.NotFound:
         await ctx.send("❌ This user is not banned!")
     except discord.Forbidden:
         await ctx.send("❌ I don't have permission to unban this user!")
     except Exception as e:
         await ctx.send(f"❌ An error occurred: {e}")
-    return
 
 
 @bot.command()
