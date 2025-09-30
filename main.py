@@ -10,7 +10,7 @@ import aiohttp
 import asyncio
 from pymongo import MongoClient
 # from webhook_utils import send_webhook_message
-from datetime import datetime, timezone
+from datetime import timezone
 from dotenv import load_dotenv
 from discord import app_commands
 from discord.ext import commands
@@ -141,7 +141,7 @@ def save_filter_words(guild_id, words):
 
         result = filter_collection.update_one(
             {"guild_id": guild_id},
-            {"$set": {"filter_words": words, "updated_at": datetime.now(timezone.utc)}},
+            {"$set": {"filter_words": words, "updated_at": datetime.datetime.now(timezone.utc)}},
             upsert=True,
         )
         return result.acknowledged
@@ -172,7 +172,7 @@ def reset_filter_words(guild_id):
             {
                 "$set": {
                     "filter_words": list(default_filter_words),
-                    "updated_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.datetime.now(timezone.utc),
                 }
             },
             upsert=True,
@@ -181,6 +181,21 @@ def reset_filter_words(guild_id):
     except Exception as e:
         print(f"[ERROR] reset_filter_words: {e}")
         return list(default_filter_words)
+
+
+def set_filter_enabled(guild_id, enabled: bool):
+    """Enable or disable the filter for a guild (stores flag in word_filters collection)."""
+    try:
+        guild_id = int(guild_id)
+        filter_collection.update_one(
+            {"guild_id": guild_id},
+            {"$set": {"enabled": bool(enabled), "updated_at": datetime.datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+        return True
+    except Exception as e:
+        print(f"[ERROR] set_filter_enabled: {e}")
+        return False
 
 
 def debug_filter_db():
@@ -226,6 +241,7 @@ def health():
     return {"status": "healthy", "bot": "online"}
 
 
+
 #  Load token from .env file
 load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
@@ -240,6 +256,14 @@ intents.members = True
 
 # Create the bot instance
 bot = commands.Bot(command_prefix="bread ", intents=intents, help_command=None)
+
+# If BOT_OWNER_ID is provided via env, set bot.owner_id for deterministic owner checks
+try:
+    env_owner = os.getenv("BOT_OWNER_ID")
+    if env_owner:
+        bot.owner_id = int(env_owner)
+except Exception:
+    pass
 
 TIME_ID = 1413747681163087893
 PING_URL = "https://bread-bot-8rqr.onrender.com/"
@@ -569,30 +593,22 @@ async def ban(
             f"✅ {member.mention} has been banned!\nReason: {reason}"
         )
 
-        # After successfully banning the member, log it
-        if BAN_LOG_CHANNEL_ID:
-            log_channel = interaction.guild.get_channel(BAN_LOG_CHANNEL_ID)
-            if log_channel:
-                embed = discord.Embed(
-                    title="🚫 Member Banned",
-                    description=f"{member.mention} was banned by {interaction.user.mention}",
-                    color=0xFF0000,
-                    timestamp=discord.utils.utcnow(),
-                )
-                embed.add_field(name="Reason", value=reason, inline=False)
-                embed.add_field(name="User ID", value=str(member.id), inline=True)
-                embed.set_thumbnail(
-                    url=(
-                        member.avatar.url
-                        if member.avatar
-                        else member.default_avatar.url
-                    )
-                )
-
-                try:
-                    await log_channel.send(embed=embed)
-                except Exception as e:
-                    print(f"Failed to send ban log: {e}")
+        # After successfully banning the member, log it (uses configured LOG_CHANNEL_ID)
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="🚫 Member Banned",
+                description=f"{member.mention} was banned by {interaction.user.mention}",
+                color=0xFF0000,
+                fields=[
+                    ("Reason", reason, False),
+                    ("User ID", str(member.id), True),
+                    ("Moderator", interaction.user.mention, True),
+                ],
+                thumbnail=(member.avatar.url if member.avatar else member.default_avatar.url),
+            )
+        except Exception:
+            pass
 
     except discord.Forbidden:
         await interaction.response.send_message(
@@ -701,6 +717,24 @@ async def mute(
         await interaction.response.send_message(
             f"✅ {member.mention} has been muted for {duration} minutes!\nReason: {reason}"
         )
+        # Log the mute to mod logs (if configured)
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="🔇 Member Muted",
+                description=f"{member.mention} has been muted for {duration} minutes.",
+                color=0xFFA500,
+                fields=[
+                    ("User", f"{member} ({member.id})", False),
+                    ("Moderator", interaction.user.mention, True),
+                    ("Duration", f"{duration} minutes", True),
+                    ("Reason", reason, True),
+                    ("Muted Until", discord.utils.format_dt(timeout_duration, "R"), True),
+                ],
+                thumbnail=member.avatar.url if member.avatar else None,
+            )
+        except Exception:
+            pass
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to timeout this member!", ephemeral=True
@@ -789,50 +823,7 @@ async def mute(
                 ("Target", f"{member} ({member.id})", True),
             ],
         )
-    if not interaction.user.guild_permissions.moderate_members:
-        await interaction.response.send_message(
-            "❌ You need moderate members permissions to use this command!",
-            ephemeral=True,
-        )
-        return
 
-    if not interaction.guild.me.guild_permissions.moderate_members:
-        await interaction.response.send_message(
-            "❌ I don't have permission to unmute members!", ephemeral=True
-        )
-        return
-
-    if member == interaction.user:
-        await interaction.response.send_message(
-            "❌ You can't unmute yourself!", ephemeral=True
-        )
-        return
-
-    if member == interaction.guild.me:
-        await interaction.response.send_message(
-            "❌ I can't unmute myself!", ephemeral=True
-        )
-        return
-
-    if member.top_role >= interaction.user.top_role:
-        await interaction.response.send_message(
-            "❌ You can't unmute someone with equal or higher roles!", ephemeral=True
-        )
-        return
-
-    try:
-        await member.timeout(None, reason=reason)
-        await interaction.response.send_message(
-            f"✅ {member.mention} has been unmuted!\nReason: {reason}"
-        )
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "❌ I don't have permission to unmute this member!", ephemeral=True
-        )
-    except Exception as e:
-        await interaction.response.send_message(
-            f"❌ An error occurred: {e}", ephemeral=True
-        )
 
 
 @bot.tree.command(name="purge", description="Purge messages from a channel")
@@ -861,6 +852,21 @@ async def purge(interaction: discord.Interaction, limit: int = 2000):
         await interaction.response.send_message(
             f"✅ Purged {limit} messages!", ephemeral=True
         )
+        # Log the purge to mod logs (if configured)
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="🗑️ Messages Purged",
+                description=f"{limit} messages were purged in {interaction.channel.mention}.",
+                color=0x3498DB,
+                fields=[
+                    ("Channel", interaction.channel.mention, True),
+                    ("Moderator", interaction.user.mention, True),
+                    ("Message Count", str(limit), True),
+                ],
+            )
+        except Exception:
+            pass
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to manage messages!", ephemeral=True
@@ -906,6 +912,22 @@ async def broadcast(
             f"✅ Broadcasted message to {channel_count} channels {ping_status}!",
             ephemeral=True,
         )
+        # Log the broadcast to mod logs (if configured)
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="📣 Broadcast Sent",
+                description=f"Broadcast sent by {interaction.user.mention} to {channel_count} channels ({ping_status}).",
+                color=0xF1C40F,
+                fields=[
+                    ("Moderator", interaction.user.mention, True),
+                    ("Channels Sent", str(channel_count), True),
+                    ("Ping Status", ping_status, True),
+                    ("Message", (message[:1024] + '...') if len(message) > 1024 else message, False),
+                ],
+            )
+        except Exception:
+            pass
     except Exception as e:
         await interaction.response.send_message(
             f"❌ An error occurred: {e}", ephemeral=True
@@ -2990,29 +3012,35 @@ async def unlock(
 
 
 @bot.command()
+@commands.is_owner()
 async def lalala(ctx):
-    if ctx.author.id != BOT_OWNER_ID:
-        await ctx.send("❌ Only the bot owner can use this command!")
-        return
+    """Shutdown command for the bot owner.
+
+    Usage (prefix): `bread lalala`
+    The owner must confirm by replying `yes` or `y` within 15 seconds.
+    """
 
     await ctx.send(
-        "Are you sure you want to Shutdown? Reply with `yes` or `y` within 15 seconds."
+        "Are you really sure you want to shutdown? Reply with `yes` within 15 seconds. No more tacos :("
     )
 
     def check(m):
         return (
             m.author == ctx.author
             and m.channel == ctx.channel
-            and m.content.lower() in ["yes", "y"]
+            and m.content.lower() in ["nico nachos tacos"]
         )
 
     try:
         msg = await bot.wait_for("message", timeout=15.0, check=check)
-        await ctx.send("Shuting down...")
+        await ctx.send("Shutting down...")
+        # Close the bot gracefully and re-exec the process (preserves existing behavior)
         await bot.close()
         os.execv(sys.executable, [sys.executable] + sys.argv)
     except asyncio.TimeoutError:
         await ctx.send("Shutdown cancelled (no confirmation received).")
+    except Exception as e:
+        await ctx.send(f"❌ Error during shutdown: {e}")
 
 
 # ▶️ Start the Flask server in a separate thread
