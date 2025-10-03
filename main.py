@@ -305,7 +305,7 @@ async def keep_alive_task():
             await channel.send(embed=embed)
             print(f"[KeepAlive] Error: {e}")
 
-        await asyncio.sleep(300)  # every 5 minutes
+        await asyncio.sleep(60)  # every 5 minutes
 
 
 # ✅ Setup hook for bot initialization
