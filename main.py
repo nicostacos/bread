@@ -10,7 +10,7 @@ import aiohttp
 import asyncio
 from pymongo import MongoClient
 # from webhook_utils import send_webhook_message
-from datetime import datetime, timezone
+from datetime import timezone
 from dotenv import load_dotenv
 from discord import app_commands
 from discord.ext import commands
@@ -141,7 +141,7 @@ def save_filter_words(guild_id, words):
 
         result = filter_collection.update_one(
             {"guild_id": guild_id},
-            {"$set": {"filter_words": words, "updated_at": datetime.now(timezone.utc)}},
+            {"$set": {"filter_words": words, "updated_at": datetime.datetime.now(timezone.utc)}},
             upsert=True,
         )
         return result.acknowledged
@@ -172,7 +172,7 @@ def reset_filter_words(guild_id):
             {
                 "$set": {
                     "filter_words": list(default_filter_words),
-                    "updated_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.datetime.now(timezone.utc),
                 }
             },
             upsert=True,
@@ -181,6 +181,21 @@ def reset_filter_words(guild_id):
     except Exception as e:
         print(f"[ERROR] reset_filter_words: {e}")
         return list(default_filter_words)
+
+
+def set_filter_enabled(guild_id, enabled: bool):
+    """Enable or disable the filter for a guild (stores flag in word_filters collection)."""
+    try:
+        guild_id = int(guild_id)
+        filter_collection.update_one(
+            {"guild_id": guild_id},
+            {"$set": {"enabled": bool(enabled), "updated_at": datetime.datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+        return True
+    except Exception as e:
+        print(f"[ERROR] set_filter_enabled: {e}")
+        return False
 
 
 def debug_filter_db():
@@ -226,6 +241,7 @@ def health():
     return {"status": "healthy", "bot": "online"}
 
 
+
 #  Load token from .env file
 load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
@@ -240,6 +256,14 @@ intents.members = True
 
 # Create the bot instance
 bot = commands.Bot(command_prefix="bread ", intents=intents, help_command=None)
+
+# If BOT_OWNER_ID is provided via env, set bot.owner_id for deterministic owner checks
+try:
+    env_owner = os.getenv("BOT_OWNER_ID")
+    if env_owner:
+        bot.owner_id = int(env_owner)
+except Exception:
+    pass
 
 TIME_ID = 1413747681163087893
 PING_URL = "https://bread-bot-8rqr.onrender.com/"
@@ -569,30 +593,22 @@ async def ban(
             f"✅ {member.mention} has been banned!\nReason: {reason}"
         )
 
-        # After successfully banning the member, log it
-        if BAN_LOG_CHANNEL_ID:
-            log_channel = interaction.guild.get_channel(BAN_LOG_CHANNEL_ID)
-            if log_channel:
-                embed = discord.Embed(
-                    title="🚫 Member Banned",
-                    description=f"{member.mention} was banned by {interaction.user.mention}",
-                    color=0xFF0000,
-                    timestamp=discord.utils.utcnow(),
-                )
-                embed.add_field(name="Reason", value=reason, inline=False)
-                embed.add_field(name="User ID", value=str(member.id), inline=True)
-                embed.set_thumbnail(
-                    url=(
-                        member.avatar.url
-                        if member.avatar
-                        else member.default_avatar.url
-                    )
-                )
-
-                try:
-                    await log_channel.send(embed=embed)
-                except Exception as e:
-                    print(f"Failed to send ban log: {e}")
+        # After successfully banning the member, log it (uses configured LOG_CHANNEL_ID)
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="🚫 Member Banned",
+                description=f"{member.mention} was banned by {interaction.user.mention}",
+                color=0xFF0000,
+                fields=[
+                    ("Reason", reason, False),
+                    ("User ID", str(member.id), True),
+                    ("Moderator", interaction.user.mention, True),
+                ],
+                thumbnail=(member.avatar.url if member.avatar else member.default_avatar.url),
+            )
+        except Exception:
+            pass
 
     except discord.Forbidden:
         await interaction.response.send_message(
@@ -628,6 +644,21 @@ async def unban(
         await interaction.response.send_message(
             f"✅ {user.name} has been unbanned!\nReason: {reason}"
         )
+        # Log the unban to mod logs
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="🔓 Member Unbanned",
+                description=f"{user.mention} was unbanned by {interaction.user.mention}",
+                color=0x00FF00,
+                fields=[
+                    ("User", f"{user} ({user.id})", False),
+                    ("Moderator", interaction.user.mention, True),
+                    ("Reason", reason, True),
+                ],
+            )
+        except Exception:
+            pass
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to unban this user!", ephemeral=True
@@ -701,6 +732,24 @@ async def mute(
         await interaction.response.send_message(
             f"✅ {member.mention} has been muted for {duration} minutes!\nReason: {reason}"
         )
+        # Log the mute to mod logs (if configured)
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="🔇 Member Muted",
+                description=f"{member.mention} has been muted for {duration} minutes.",
+                color=0xFFA500,
+                fields=[
+                    ("User", f"{member} ({member.id})", False),
+                    ("Moderator", interaction.user.mention, True),
+                    ("Duration", f"{duration} minutes", True),
+                    ("Reason", reason, True),
+                    ("Muted Until", discord.utils.format_dt(timeout_duration, "R"), True),
+                ],
+                thumbnail=member.avatar.url if member.avatar else None,
+            )
+        except Exception:
+            pass
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to timeout this member!", ephemeral=True
@@ -789,50 +838,7 @@ async def mute(
                 ("Target", f"{member} ({member.id})", True),
             ],
         )
-    if not interaction.user.guild_permissions.moderate_members:
-        await interaction.response.send_message(
-            "❌ You need moderate members permissions to use this command!",
-            ephemeral=True,
-        )
-        return
 
-    if not interaction.guild.me.guild_permissions.moderate_members:
-        await interaction.response.send_message(
-            "❌ I don't have permission to unmute members!", ephemeral=True
-        )
-        return
-
-    if member == interaction.user:
-        await interaction.response.send_message(
-            "❌ You can't unmute yourself!", ephemeral=True
-        )
-        return
-
-    if member == interaction.guild.me:
-        await interaction.response.send_message(
-            "❌ I can't unmute myself!", ephemeral=True
-        )
-        return
-
-    if member.top_role >= interaction.user.top_role:
-        await interaction.response.send_message(
-            "❌ You can't unmute someone with equal or higher roles!", ephemeral=True
-        )
-        return
-
-    try:
-        await member.timeout(None, reason=reason)
-        await interaction.response.send_message(
-            f"✅ {member.mention} has been unmuted!\nReason: {reason}"
-        )
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "❌ I don't have permission to unmute this member!", ephemeral=True
-        )
-    except Exception as e:
-        await interaction.response.send_message(
-            f"❌ An error occurred: {e}", ephemeral=True
-        )
 
 
 @bot.tree.command(name="purge", description="Purge messages from a channel")
@@ -861,6 +867,21 @@ async def purge(interaction: discord.Interaction, limit: int = 2000):
         await interaction.response.send_message(
             f"✅ Purged {limit} messages!", ephemeral=True
         )
+        # Log the purge to mod logs (if configured)
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="🗑️ Messages Purged",
+                description=f"{limit} messages were purged in {interaction.channel.mention}.",
+                color=0x3498DB,
+                fields=[
+                    ("Channel", interaction.channel.mention, True),
+                    ("Moderator", interaction.user.mention, True),
+                    ("Message Count", str(limit), True),
+                ],
+            )
+        except Exception:
+            pass
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to manage messages!", ephemeral=True
@@ -906,6 +927,22 @@ async def broadcast(
             f"✅ Broadcasted message to {channel_count} channels {ping_status}!",
             ephemeral=True,
         )
+        # Log the broadcast to mod logs (non-fatal)
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="📣 Broadcast Sent",
+                description=f"Broadcast sent by {interaction.user.mention} to {channel_count} channels ({ping_status}).",
+                color=0xF1C40F,
+                fields=[
+                    ("Moderator", interaction.user.mention, True),
+                    ("Channels Sent", str(channel_count), True),
+                    ("Ping Status", ping_status, True),
+                    ("Message", (message[:1024] + '...') if len(message) > 1024 else message, False),
+                ],
+            )
+        except Exception:
+            pass
     except Exception as e:
         await interaction.response.send_message(
             f"❌ An error occurred: {e}", ephemeral=True
@@ -922,10 +959,31 @@ async def set_welcome_channel(
 ):
     """Set the welcome channel for new members (slash command)"""
     global WELCOME_CHANNEL_ID
+    # Persist welcome channel to DB (non-fatal)
+    try:
+        save_config(guild_id=interaction.guild.id, welcome_channel=channel.id)
+    except Exception:
+        pass
+
     WELCOME_CHANNEL_ID = channel.id
     await interaction.response.send_message(
         f"✅ Welcome channel set to {channel.mention}", ephemeral=True
     )
+
+    # Log the change to mod logs (non-fatal)
+    try:
+        await send_mod_log(
+            guild=interaction.guild,
+            title="🎉 Welcome Channel Set",
+            description=f"Welcome channel set to {channel.mention} by {interaction.user.mention}",
+            color=0x00FF00,
+            fields=[
+                ("Channel", channel.mention, True),
+                ("Moderator", interaction.user.mention, True),
+            ],
+        )
+    except Exception:
+        pass
 
 
 async def send_mod_log(
@@ -1457,6 +1515,22 @@ async def broadcast(ctx, *, message):
             f"✅ Broadcasted message to {channel_count} channels {ping_status}!",
             delete_after=5,
         )
+        # Log the broadcast to mod logs (non-fatal)
+        try:
+            await send_mod_log(
+                guild=ctx.guild,
+                title="📣 Broadcast Sent",
+                description=f"Broadcast sent by {ctx.author.mention} to {channel_count} channels ({ping_status}).",
+                color=0xF1C40F,
+                fields=[
+                    ("Moderator", ctx.author.mention, True),
+                    ("Channels Sent", str(channel_count), True),
+                    ("Ping Status", ping_status, True),
+                    ("Message", (message[:1024] + '...') if len(message) > 1024 else message, False),
+                ],
+            )
+        except Exception:
+            pass
     except Exception as e:
         await ctx.send(f"❌ An error occurred: {e}")
 
@@ -1497,6 +1571,20 @@ async def set_channel(
             response += f"- Welcome Channel: {welcome_channel.mention}"
 
         await interaction.response.send_message(response, ephemeral=True)
+        # Log the configuration change to mod logs (non-fatal)
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="⚙️ Channel Configuration Updated",
+                description=f"Log channel: {('<#'+str(new_log)+'>' ) if new_log else 'Not set'}, Welcome channel: {('<#'+str(new_welcome)+'>' ) if new_welcome else 'Not set'}",
+                color=0x00FF00,
+                fields=[
+                    ("Log Channel", (log_channel.mention if log_channel else (f'<#{current_log}>' if current_log else 'Not set')), True),
+                    ("Welcome Channel", (welcome_channel.mention if welcome_channel else (f'<#{current_welcome}>' if current_welcome else 'Not set')), True),
+                ],
+            )
+        except Exception:
+            pass
 
     except Exception as e:
         await interaction.response.send_message(
@@ -1762,7 +1850,7 @@ async def help(ctx, *, command_name=None):
     # Create main help embed
     embed = discord.Embed(
         title="🍞 Bread Bot - Command Reference",
-        description="**Available Commands** • Use `bread help <command>` for detailed info",
+        description="**Available Commands** • Use `bread help <command>` to for detailed info",
         color=0x00FF00,
     )
 
@@ -2049,7 +2137,7 @@ async def slash_help(interaction: discord.Interaction, command: str = None):
             "broadcast": {
                 "description": "Send a message to all channels in the server",
                 "usage": "`/broadcast message:<text> [ping:<true/false>]` or `bread broadcast [message]`",
-                "example": "`/broadcast message:Server restart in 5 minutes ping:true`\n`bread broadcast ping Server restart in 5 minutes`",
+                               "example": "`/broadcast message:Server restart in 5 minutes ping:true`\n`bread broadcast ping Server restart in 5 minutes`",
             },
         }.get(command.lower())
 
@@ -2090,6 +2178,7 @@ async def slash_help(interaction: discord.Interaction, command: str = None):
             )
 
         await interaction.response.send_message(embed=embed)
+
         return
 
     # Main help command (no specific command requested)
@@ -2100,10 +2189,7 @@ async def slash_help(interaction: discord.Interaction, command: str = None):
     )
 
     # Add bot avatar
-    if interaction.guild and interaction.guild.me.avatar:
-        embed.set_thumbnail(url=interaction.guild.me.avatar.url)
-    elif interaction.client.user.avatar:
-        embed.set_thumbnail(url=interaction.client.user.avatar.url)
+    embed.set_thumbnail(url=interaction.guild.me.avatar.url)
 
     # General Commands (always visible)
     general_commands = [
@@ -2157,15 +2243,15 @@ async def slash_help(interaction: discord.Interaction, command: str = None):
             ("/unmute @user [reason] | bread unmute @user [reason]", "Unmute a member"),
             (
                 "/purge [amount] [reason] | bread purge [amount] [reason]",
-                "Delete messages (default: 10, max: 100)",
+                "Delete messages (default: 10, max: 2000)",
             ),
             (
                 "/lock [#channel] [reason] | bread lock [#channel] [reason]",
-                "Lock a channel (current channel if none specified)",
+                "Lock a channel (default: current)",
             ),
             (
                 "/unlock [#channel] [reason] | bread unlock [#channel] [reason]",
-                "Unlock a channel (current channel if none specified)",
+                "Unlock a channel",
             ),
         ]
 
@@ -2201,7 +2287,7 @@ async def slash_help(interaction: discord.Interaction, command: str = None):
         ]
 
         # Format admin commands
-        admin_text = "\n".join([f"`{cmd}` - {desc}" for cmd, desc in admin_commands])
+        admin_text = "\n".join([f"`bread {cmd}` - {desc}" for cmd, desc in admin_commands])
 
         # Add admin commands section
         embed.add_field(name="⚙️ Admin Commands", value=admin_text, inline=False)
@@ -2242,7 +2328,20 @@ async def setwelcome(ctx, channel: discord.TextChannel = None):
 
     global WELCOME_CHANNEL_ID
     WELCOME_CHANNEL_ID = channel.id
-    await ctx.send(f"✅ Welcome channel set to {channel.mention}")
+    # Log the change to mod logs (non-fatal)
+    try:
+        await send_mod_log(
+            guild=ctx.guild,
+            title="🎉 Welcome Channel Set",
+            description=f"Welcome channel set to {channel.mention} by {ctx.author.mention}",
+            color=0x00FF00,
+            fields=[
+                ("Channel", channel.mention, True),
+                ("Moderator", ctx.author.mention, True),
+            ],
+        )
+    except Exception:
+        pass
 
 
 @bot.command()
@@ -2324,11 +2423,6 @@ async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
                 ("Target", f"{member} ({member.id})", True),
             ],
         )
-
-    except discord.Forbidden:
-        await ctx.send("❌ I don't have permission to ban this member!")
-    except Exception as e:
-        await ctx.send(f"❌ An error occurred: {e}")
 
 
 @bot.tree.command(name="status", description="Show bot status and statistics")
@@ -2624,6 +2718,22 @@ async def lock(
 
         await interaction.response.send_message(embed=embed)
 
+        # Log the channel lock to mod logs
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="🔒 Channel Locked",
+                description=f"{target_channel.mention} was locked by {interaction.user.mention}",
+                color=0xFF0000,
+                fields=[
+                    ("Channel", target_channel.mention, True),
+                    ("Moderator", interaction.user.mention, True),
+                    ("Reason", reason or "No reason provided", False),
+                ],
+            )
+        except Exception:
+            pass
+
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to modify this channel!", ephemeral=True
@@ -2718,13 +2828,27 @@ async def unban(ctx, user: discord.User, *, reason="No reason provided"):
     try:
         await ctx.guild.unban(user, reason=reason)
         await ctx.send(f"✅ {user.mention} has been unbanned!\nReason: {reason}")
+        # Log the unban to mod logs
+        try:
+            await send_mod_log(
+                guild=ctx.guild,
+                title="🔓 Member Unbanned",
+                description=f"{user.mention} was unbanned by {ctx.author.mention}",
+                color=0x00FF00,
+                fields=[
+                    ("User", f"{user} ({user.id})", False),
+                    ("Moderator", ctx.author.mention, True),
+                    ("Reason", reason, True),
+                ],
+            )
+        except Exception:
+            pass
     except discord.NotFound:
         await ctx.send("❌ This user is not banned!")
     except discord.Forbidden:
         await ctx.send("❌ I don't have permission to unban this user!")
     except Exception as e:
         await ctx.send(f"❌ An error occurred: {e}")
-    return
 
 
 @bot.command()
@@ -2990,29 +3114,35 @@ async def unlock(
 
 
 @bot.command()
+@commands.is_owner()
 async def lalala(ctx):
-    if ctx.author.id != BOT_OWNER_ID:
-        await ctx.send("❌ Only the bot owner can use this command!")
-        return
+    """Shutdown command for the bot owner.
+
+    Usage (prefix): `bread lalala`
+    The owner must confirm by replying `yes` or `y` within 15 seconds.
+    """
 
     await ctx.send(
-        "Are you sure you want to Shutdown? Reply with `yes` or `y` within 15 seconds."
+        "Are you really sure you want to shutdown? Reply with `yes` within 15 seconds. No more tacos :("
     )
 
     def check(m):
         return (
             m.author == ctx.author
             and m.channel == ctx.channel
-            and m.content.lower() in ["yes", "y"]
+            and m.content.lower() in ["nico nachos tacos"]
         )
 
     try:
         msg = await bot.wait_for("message", timeout=15.0, check=check)
-        await ctx.send("Shuting down...")
+        await ctx.send("Shutting down...")
+        # Close the bot gracefully and re-exec the process (preserves existing behavior)
         await bot.close()
         os.execv(sys.executable, [sys.executable] + sys.argv)
     except asyncio.TimeoutError:
         await ctx.send("Shutdown cancelled (no confirmation received).")
+    except Exception as e:
+        await ctx.send(f"❌ Error during shutdown: {e}")
 
 
 # ▶️ Start the Flask server in a separate thread
