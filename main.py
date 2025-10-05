@@ -230,6 +230,7 @@ def health():
     return {"status": "healthy", "bot": "online"}
 
 
+
 load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
 
@@ -240,14 +241,6 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="bread ", intents=intents, help_command=None)
-
-
-try:
-    env_owner = os.getenv("BOT_OWNER_ID")
-    if env_owner:
-        bot.owner_id = int(env_owner)
-except Exception:
-    pass
 
 TIME_ID = 1413747681163087893
 PING_URL = "https://bread-bot-8rqr.onrender.com/"
@@ -286,7 +279,7 @@ async def keep_alive_task():
             await channel.send(embed=embed)
             print(f"[KeepAlive] Error: {e}")
 
-        await asyncio.sleep(300)  # every 5 minutes
+        await asyncio.sleep(60)  # every 5 minutes
 
 
 @bot.event
@@ -300,6 +293,25 @@ async def setup_hook():
         else:
             for cmd in bot.tree.get_commands():
                 try:
+                    if not hasattr(cmd, "checks"):
+                        continue
+                    cmd.checks.append(global_slash_block_check)
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"[WARN] Could not register global slash check: {e}")
+
+    # Register global slash/app command check for blacklisted users.
+    # Preferred method: CommandTree.add_check (newer discord.py). If it's not available,
+    # fall back to appending the check to each command's checks list.
+    try:
+        if hasattr(bot.tree, "add_check"):
+            bot.tree.add_check(global_slash_block_check)
+        else:
+            # Fallback: append the predicate to each command's checks list
+            for cmd in bot.tree.get_commands():
+                try:
+                    # Many app_commands.Command implementations expose a `checks` list
                     if not hasattr(cmd, "checks"):
                         continue
                     cmd.checks.append(global_slash_block_check)
@@ -324,271 +336,6 @@ async def on_ready():
         debug_db()
     except Exception as e:
         print(f"❌ Failed to sync commands: {e}")
-
-
-# --- Guild blacklist collection and global blacklist 
-guild_blacklist_collection = db["guild_blacklists"]
-try:
-    guild_blacklist_collection.create_index("guild_id", unique=True)
-    print("✅ Created index on guild_id for guild_blacklists")
-except Exception as e:
-    print(f"ℹ️ Could not create index for guild_blacklists: {e}")
-
-# Global blacklist only editable in source code
-GLOBAL_BLACKLIST = [
-  1400613835445899416, # Tray's main acc ##################### Pinkly #chloe's main acc
-  1420535411339563234, #Tray's alt 
-]
-
-BLACKLIST_BLOCK_MESSAGE = "You are banned from using this bot. If you think this is an mistake please contact either the server admins or the bot owner."
-
-
-def add_guild_blacklist(guild_id: int, user_id: int):
-    try:
-        guild_blacklist_collection.update_one(
-            {"guild_id": int(guild_id)},
-            {"$addToSet": {"user_ids": int(user_id)}},
-            upsert=True,
-        )
-        return True
-    except Exception as e:
-        print(f"[ERROR] add_guild_blacklist: {e}")
-        return False
-
-
-def remove_guild_blacklist(guild_id: int, user_id: int):
-    try:
-        guild_blacklist_collection.update_one(
-            {"guild_id": int(guild_id)}, {"$pull": {"user_ids": int(user_id)}}
-        )
-        return True
-    except Exception as e:
-        print(f"[ERROR] remove_guild_blacklist: {e}")
-        return False
-
-
-def get_guild_blacklist(guild_id: int):
-    try:
-        doc = guild_blacklist_collection.find_one({"guild_id": int(guild_id)})
-        if doc and "user_ids" in doc:
-            return [int(u) for u in doc.get("user_ids", [])]
-        return []
-    except Exception as e:
-        print(f"[ERROR] get_guild_blacklist: {e}")
-        return []
-
-
-def is_user_blocked(guild_id: int, user_id: int):
-    if int(user_id) in GLOBAL_BLACKLIST:
-        return True
-    try:
-        return int(user_id) in get_guild_blacklist(guild_id)
-    except Exception:
-        return False
-
-
-@bot.before_invoke
-async def global_prefix_block_check(ctx):
-    try:
-        if not ctx.guild:
-            return
-        if is_user_blocked(ctx.guild.id, ctx.author.id):
-            try:
-                block_type = "Global blacklist" if int(ctx.author.id) in GLOBAL_BLACKLIST else "Server blacklist"
-            except Exception:
-                block_type = "Server blacklist"
-            try:
-                command_name = getattr(ctx.command, 'name', None) or ctx.invoked_with or 'unknown'
-            except Exception:
-                command_name = 'unknown'
-            await ctx.send(BLACKLIST_BLOCK_MESSAGE)
-
-            try:
-                await send_mod_log(
-                    guild=ctx.guild,
-                    title="⛔ Blocked Command Attempt",
-                    description=f"{ctx.author.mention} attempted to run `{command_name}` but was blocked.",
-                    color=0xFF0000,
-                    fields=[
-                        ("User", f"{ctx.author} ({ctx.author.id})", False),
-                        ("Type", block_type, True),
-                        ("Command", command_name, True),
-                        ("Channel", ctx.channel.mention if ctx.channel else "DM", True),
-                        ("Context", "prefix", True),
-                    ],
-                    thumbnail=(ctx.author.avatar.url if ctx.author.avatar else None),
-                )
-            except Exception:
-                pass
-
-            raise commands.CheckFailure("user_blacklisted")
-    except commands.CheckFailure:
-        raise
-    except Exception as e:
-        print(f"[WARN] global_prefix_block_check error: {e}")
-
-
-async def global_slash_block_check(interaction: discord.Interaction):
-    """Check for slash/app command invocations from blacklisted users.
-    This will be registered with bot.tree.add_check(...) after the bot is created.
-    """
-    try:
-        if not interaction.guild:
-            return True
-        if is_user_blocked(interaction.guild.id, interaction.user.id):
-            try:
-                await interaction.response.send_message(BLACKLIST_BLOCK_MESSAGE, ephemeral=True)
-            except Exception:
-                pass
-            try:
-                block_type = "Global blacklist" if int(interaction.user.id) in GLOBAL_BLACKLIST else "Server blacklist"
-            except Exception:
-                block_type = "Server blacklist"
-            try:
-                cmd_name = None
-                if hasattr(interaction, 'command') and interaction.command:
-                    cmd_name = getattr(interaction.command, 'name', None)
-                if not cmd_name:
-                    cmd_name = interaction.data.get('name') if isinstance(interaction.data, dict) else None
-                if not cmd_name:
-                    cmd_name = 'unknown'
-            except Exception:
-                cmd_name = 'unknown'
-            try:
-                if interaction.guild:
-                    ch_mention = interaction.channel.mention if getattr(interaction, 'channel', None) else 'DM'
-                    await send_mod_log(
-                        guild=interaction.guild,
-                        title="⛔ Blocked Command Attempt",
-                        description=f"{interaction.user.mention} attempted to run `{cmd_name}` but was blocked.",
-                        color=0xFF0000,
-                        fields=[
-                            ("User", f"{interaction.user} ({interaction.user.id})", False),
-                            ("Type", block_type, True),
-                            ("Command", cmd_name, True),
-                            ("Channel", ch_mention, True),
-                            ("Context", "slash", True),
-                        ],
-                        thumbnail=(interaction.user.avatar.url if interaction.user.avatar else None),
-                    )
-            except Exception:
-                pass
-
-            raise app_commands.CheckFailure("user_blacklisted")
-        return True
-    except app_commands.CheckFailure:
-        raise
-    except Exception as e:
-        print(f"[WARN] global_slash_block_check error: {e}")
-        return True
-
-
-@bot.tree.command(name="blacklist", description="Manage the server blacklist (admins only)")
-@app_commands.describe(action="add/remove/list", user="User to add/remove")
-@app_commands.choices(action=[app_commands.Choice(name="add", value="add"), app_commands.Choice(name="remove", value="remove"), app_commands.Choice(name="list", value="list")])
-@commands.has_permissions(administrator=True)
-async def blacklist(interaction: discord.Interaction, action: str, user: discord.User = None):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Administrator permissions required", ephemeral=True)
-        return
-
-    guild_id = interaction.guild_id
-    if action == "add":
-        if not user:
-            await interaction.response.send_message("❌ Please specify a user to add", ephemeral=True)
-            return
-        add_guild_blacklist(guild_id, user.id)
-        await interaction.response.send_message(f"✅ {user.mention} added to server blacklist", ephemeral=True)
-        try:
-            await send_mod_log(
-                guild=interaction.guild,
-                title="⛔ User Blacklisted (Server)",
-                description=f"{user.mention} was added to the server blacklist by {interaction.user.mention}",
-                color=0xFF0000,
-                fields=[("User", f"{user} ({user.id})", False), ("Moderator", interaction.user.mention, True)],
-            )
-        except Exception:
-            pass
-    elif action == "remove":
-        if not user:
-            await interaction.response.send_message("❌ Please specify a user to remove", ephemeral=True)
-            return
-        remove_guild_blacklist(guild_id, user.id)
-        await interaction.response.send_message(f"✅ {user.mention} removed from server blacklist", ephemeral=True)
-        try:
-            await send_mod_log(
-                guild=interaction.guild,
-                title="✅ User Removed from Blacklist",
-                description=f"{user.mention} was removed from server blacklist by {interaction.user.mention}",
-                color=0x00FF00,
-                fields=[("User", f"{user} ({user.id})", False), ("Moderator", interaction.user.mention, True)],
-            )
-        except Exception:
-            pass
-    else:  # list
-        users = get_guild_blacklist(guild_id)
-        if not users:
-            await interaction.response.send_message("No users are blacklisted on this server.", ephemeral=True)
-            return
-        mentions = []
-        for uid in users:
-            member = interaction.guild.get_member(int(uid))
-            mentions.append(member.mention if member else f"<@{uid}>")
-        await interaction.response.send_message("Blacklisted users: " + ", ".join(mentions), ephemeral=True)
-
-
-@bot.command(name="blacklist", help="Manage server blacklist (admin only)")
-@commands.has_permissions(administrator=True)
-async def blacklist_cmd(ctx, action: str, user: discord.User = None):
-    if not ctx.author.guild_permissions.administrator:
-        await ctx.send("❌ Administrator permissions required")
-        return
-
-    guild_id = ctx.guild.id
-    if action.lower() == "add":
-        if not user:
-            await ctx.send("❌ Please specify a user to add")
-            return
-        add_guild_blacklist(guild_id, user.id)
-        await ctx.send(f"✅ {user.mention} added to server blacklist")
-        try:
-            await send_mod_log(
-                guild=ctx.guild,
-                title="⛔ User Blacklisted (Server)",
-                description=f"{user.mention} was added to the server blacklist by {ctx.author.mention}",
-                color=0xFF0000,
-                fields=[("User", f"{user} ({user.id})", False), ("Moderator", ctx.author.mention, True)],
-            )
-        except Exception:
-            pass
-    elif action.lower() == "remove":
-        if not user:
-            await ctx.send("❌ Please specify a user to remove")
-            return
-        remove_guild_blacklist(guild_id, user.id)
-        await ctx.send(f"✅ {user.mention} removed from server blacklist")
-        try:
-            await send_mod_log(
-                guild=ctx.guild,
-                title="✅ User Removed from Blacklist",
-                description=f"{user.mention} was removed from server blacklist by {ctx.author.mention}",
-                color=0x00FF00,
-                fields=[("User", f"{user} ({user.id})", False), ("Moderator", ctx.author.mention, True)],
-            )
-        except Exception:
-            pass
-    elif action.lower() == "list":
-        users = get_guild_blacklist(guild_id)
-        if not users:
-            await ctx.send("No users are blacklisted on this server.")
-            return
-        mentions = []
-        for uid in users:
-            member = ctx.guild.get_member(int(uid))
-            mentions.append(member.mention if member else f"<@{uid}>")
-        await ctx.send("Blacklisted users: " + ", ".join(mentions))
-    else:
-        await ctx.send("❌ Invalid action. Use: add, remove, list")
 
 
 @bot.tree.command(name="test", description="A simple test command")
@@ -827,21 +574,30 @@ async def ban(
             f"✅ {member.mention} has been banned!\nReason: {reason}"
         )
 
-        try:
-            await send_mod_log(
-                guild=interaction.guild,
-                title="🚫 Member Banned",
-                description=f"{member.mention} was banned by {interaction.user.mention}",
-                color=0xFF0000,
-                fields=[
-                    ("Reason", reason, False),
-                    ("User ID", str(member.id), True),
-                    ("Moderator", interaction.user.mention, True),
-                ],
-                thumbnail=(member.avatar.url if member.avatar else member.default_avatar.url),
-            )
-        except Exception:
-            pass
+        # After successfully banning the member, log it
+        if BAN_LOG_CHANNEL_ID:
+            log_channel = interaction.guild.get_channel(BAN_LOG_CHANNEL_ID)
+            if log_channel:
+                embed = discord.Embed(
+                    title="🚫 Member Banned",
+                    description=f"{member.mention} was banned by {interaction.user.mention}",
+                    color=0xFF0000,
+                    timestamp=discord.utils.utcnow(),
+                )
+                embed.add_field(name="Reason", value=reason, inline=False)
+                embed.add_field(name="User ID", value=str(member.id), inline=True)
+                embed.set_thumbnail(
+                    url=(
+                        member.avatar.url
+                        if member.avatar
+                        else member.default_avatar.url
+                    )
+                )
+
+                try:
+                    await log_channel.send(embed=embed)
+                except Exception as e:
+                    print(f"Failed to send ban log: {e}")
 
     except discord.Forbidden:
         await interaction.response.send_message(
@@ -877,20 +633,6 @@ async def unban(
         await interaction.response.send_message(
             f"✅ {user.name} has been unbanned!\nReason: {reason}"
         )
-        try:
-            await send_mod_log(
-                guild=interaction.guild,
-                title="🔓 Member Unbanned",
-                description=f"{user.mention} was unbanned by {interaction.user.mention}",
-                color=0x00FF00,
-                fields=[
-                    ("User", f"{user} ({user.id})", False),
-                    ("Moderator", interaction.user.mention, True),
-                    ("Reason", reason, True),
-                ],
-            )
-        except Exception:
-            pass
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to unban this user!", ephemeral=True
@@ -957,23 +699,6 @@ async def mute(
         await interaction.response.send_message(
             f"✅ {member.mention} has been muted for {duration} minutes!\nReason: {reason}"
         )
-        try:
-            await send_mod_log(
-                guild=interaction.guild,
-                title="🔇 Member Muted",
-                description=f"{member.mention} has been muted for {duration} minutes.",
-                color=0xFFA500,
-                fields=[
-                    ("User", f"{member} ({member.id})", False),
-                    ("Moderator", interaction.user.mention, True),
-                    ("Duration", f"{duration} minutes", True),
-                    ("Reason", reason, True),
-                    ("Muted Until", discord.utils.format_dt(timeout_duration, "R"), True),
-                ],
-                thumbnail=member.avatar.url if member.avatar else None,
-            )
-        except Exception:
-            pass
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to timeout this member!", ephemeral=True
@@ -1081,20 +806,6 @@ async def purge(interaction: discord.Interaction, limit: int = 2000):
         await interaction.response.send_message(
             f"✅ Purged {limit} messages!", ephemeral=True
         )
-        try:
-            await send_mod_log(
-                guild=interaction.guild,
-                title="🗑️ Messages Purged",
-                description=f"{limit} messages were purged in {interaction.channel.mention}.",
-                color=0x3498DB,
-                fields=[
-                    ("Channel", interaction.channel.mention, True),
-                    ("Moderator", interaction.user.mention, True),
-                    ("Message Count", str(limit), True),
-                ],
-            )
-        except Exception:
-            pass
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ I don't have permission to manage messages!", ephemeral=True
@@ -1140,21 +851,6 @@ async def broadcast(
             f"✅ Broadcasted message to {channel_count} channels {ping_status}!",
             ephemeral=True,
         )
-        try:
-            await send_mod_log(
-                guild=interaction.guild,
-                title="📣 Broadcast Sent",
-                description=f"Broadcast sent by {interaction.user.mention} to {channel_count} channels ({ping_status}).",
-                color=0xF1C40F,
-                fields=[
-                    ("Moderator", interaction.user.mention, True),
-                    ("Channels Sent", str(channel_count), True),
-                    ("Ping Status", ping_status, True),
-                    ("Message", (message[:1024] + '...') if len(message) > 1024 else message, False),
-                ],
-            )
-        except Exception:
-            pass
     except Exception as e:
         await interaction.response.send_message(
             f"❌ An error occurred: {e}", ephemeral=True
@@ -1171,29 +867,10 @@ async def set_welcome_channel(
 ):
     """Set the welcome channel for new members (slash command)"""
     global WELCOME_CHANNEL_ID
-    try:
-        save_config(guild_id=interaction.guild.id, welcome_channel=channel.id)
-    except Exception:
-        pass
-
     WELCOME_CHANNEL_ID = channel.id
     await interaction.response.send_message(
         f"✅ Welcome channel set to {channel.mention}", ephemeral=True
     )
-
-    try:
-        await send_mod_log(
-            guild=interaction.guild,
-            title="🎉 Welcome Channel Set",
-            description=f"Welcome channel set to {channel.mention} by {interaction.user.mention}",
-            color=0x00FF00,
-            fields=[
-                ("Channel", channel.mention, True),
-                ("Moderator", interaction.user.mention, True),
-            ],
-        )
-    except Exception:
-        pass
 
 
 async def send_mod_log(
@@ -1206,36 +883,11 @@ async def send_mod_log(
 ):
     """Helper function to send mod logs to the log channel"""
     global LOG_CHANNEL_ID
+    if not LOG_CHANNEL_ID:
+        return False
 
     try:
-        log_channel_id = None
-        try:
-            if guild and hasattr(guild, "id"):
-                saved_log, _ = load_config(guild.id)
-                if saved_log:
-                    log_channel_id = saved_log
-        except Exception:
-            log_channel_id = None
-
-        if not log_channel_id:
-            log_channel_id = LOG_CHANNEL_ID
-
-        if not log_channel_id:
-            return False
-
-        log_channel = None
-        if guild:
-            try:
-                log_channel = guild.get_channel(int(log_channel_id))
-            except Exception:
-                log_channel = None
-
-        if not log_channel and 'bot' in globals():
-            try:
-                log_channel = bot.get_channel(int(log_channel_id))
-            except Exception:
-                log_channel = None
-
+        log_channel = guild.get_channel(LOG_CHANNEL_ID)
         if not log_channel:
             return False
 
@@ -1309,7 +961,7 @@ async def on_message(message):
                     await message.delete()
                     embed = discord.Embed(
                         title="🚫 Message Filtered",
-                        description=f"{message.author.mention} Dont use that word here!",
+                        description=f"{message.author.mention} Bad boy don't use that word!",
                         color=0xFF0000,
                     )
                     embed.set_footer(text="Message deleted by chat filter")
@@ -1699,6 +1351,89 @@ async def filter(ctx, action=None, *, word=None):
     else:
         await ctx.send("❌ Invalid action! Use: `add`, `remove`, `list`, or `reset`")
         return
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def broadcast(ctx, *, message):
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("No one wants to hear you talking")
+        return
+
+    if not ctx.guild.me.guild_permissions.send_messages:
+        await ctx.send("❌ I don't have permission to send messages!")
+        return
+
+    try:
+        await ctx.message.delete()
+
+        # Check if message starts with "ping" to enable @everyone
+        if message.lower().startswith("ping "):
+            ping_everyone = True
+            message = message[5:]  # Remove "ping" from the start
+        else:
+            ping_everyone = False
+
+        channel_count = 0
+        broadcast_message = f"@everyone {message}" if ping_everyone else message
+
+        for channel in ctx.guild.text_channels:
+            try:
+                await channel.send(broadcast_message)
+                channel_count += 1
+            except discord.Forbidden:
+                continue
+
+        ping_status = "with @everyone ping" if ping_everyone else "without ping"
+        await ctx.send(
+            f"✅ Broadcasted message to {channel_count} channels {ping_status}!",
+            delete_after=5,
+        )
+    except Exception as e:
+        await ctx.send(f"❌ An error occurred: {e}")
+
+
+@bot.tree.command(name="setchannel", description="Set up log and welcome channels")
+async def set_channel(
+    interaction: discord.Interaction,
+    log_channel: discord.TextChannel = None,
+    welcome_channel: discord.TextChannel = None,
+):
+    """Set up log and welcome channels for the server"""
+    try:
+        if not any([log_channel, welcome_channel]):
+            return await interaction.response.send_message(
+                "Please specify at least one channel (log_channel or welcome_channel).",
+                ephemeral=True,
+            )
+
+        # Get current config
+        current_log, current_welcome = load_config(interaction.guild_id)
+
+        # Update config with new values
+        new_log = log_channel.id if log_channel else current_log
+        new_welcome = welcome_channel.id if welcome_channel else current_welcome
+
+        # Save to MongoDB
+        save_config(
+            guild_id=interaction.guild_id,
+            log_channel=new_log,
+            welcome_channel=new_welcome,
+        )
+
+        # Prepare response
+        response = "✅ Channel configuration updated!\n"
+        if log_channel:
+            response += f"- Log Channel: {log_channel.mention}\n"
+        if welcome_channel:
+            response += f"- Welcome Channel: {welcome_channel.mention}"
+
+        await interaction.response.send_message(response, ephemeral=True)
+
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ An error occurred: {str(e)}", ephemeral=True
+        )
 
 
 @bot.command(
