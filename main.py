@@ -866,6 +866,148 @@ async def global_slash_block_check(interaction: discord.Interaction):
     except Exception as e:
         print(f"[WARN] global_slash_block_check error: {e}")
         return True
+    
+@bot.tree.command(name="weather", description="Get weather information for a specific location")
+@app_commands.describe(location="The city or location to get weather for (e.g., 'New York City', 'Houston')")
+async def weather(interaction: discord.Interaction, location: str):
+    """Get current weather information for a specified location"""
+    await interaction.response.defer()
+
+    try:
+        # First, geocode the location to get coordinates
+        async with aiohttp.ClientSession() as session:
+            # Use Open-Meteo's geocoding API
+            geocode_url = "https://geocoding-api.open-meteo.com/v1/search"
+            geocode_params = {
+                "name": location,
+                "count": 1,
+                "language": "en",
+            }
+
+            async with session.get(geocode_url, params=geocode_params) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send("❌ Failed to find location. Try a different search.", ephemeral=True)
+                    return
+                geo_data = await resp.json()
+
+            if not geo_data.get("results"):
+                await interaction.followup.send(f"❌ Location '{location}' not found. Please try another location.", ephemeral=True)
+                return
+
+            result = geo_data["results"][0]
+            latitude = result.get("latitude")
+            longitude = result.get("longitude")
+            city_name = result.get("name", "Unknown")
+            country = result.get("country", "")
+            admin = result.get("admin1", "")
+
+            # Request current weather from Open-Meteo (use current_weather)
+            weather_url = "https://api.open-meteo.com/v1/forecast"
+            weather_params = {
+                "latitude": latitude,
+                "longitude": longitude,
+                "current_weather": True,
+                "temperature_unit": "fahrenheit",
+                "timezone": "auto",
+            }
+
+            async with session.get(weather_url, params=weather_params) as resp2:
+                if resp2.status != 200:
+                    await interaction.followup.send("❌ Failed to fetch weather data.", ephemeral=True)
+                    return
+                weather_data = await resp2.json()
+
+        # Open-Meteo returns 'current_weather' with keys like temperature, windspeed, winddirection, weathercode
+        current = weather_data.get("current_weather", {}) or {}
+
+        # Map WMO weather codes to descriptions
+        weather_codes = {
+            0: ("☀️ Clear sky", 0xFDB813),
+            1: ("🌤️ Mainly clear", 0xFDB813),
+            2: ("⛅ Partly cloudy", 0xA3A3A3),
+            3: ("☁️ Overcast", 0x808080),
+            45: ("🌫️ Foggy", 0xB0C4DE),
+            48: ("🌫️ Depositing rime fog", 0xB0C4DE),
+            51: ("🌧️ Light drizzle", 0x4169E1),
+            53: ("🌧️ Moderate drizzle", 0x4169E1),
+            55: ("🌧️ Dense drizzle", 0x1E90FF),
+            61: ("🌧️ Slight rain", 0x4169E1),
+            63: ("🌧️ Moderate rain", 0x1E90FF),
+            65: ("⛈️ Heavy rain", 0x00008B),
+            71: ("❄️ Slight snow", 0xFFFFFF),
+            73: ("❄️ Moderate snow", 0xDCDCDC),
+            75: ("❄️ Heavy snow", 0xB0E0E6),
+            77: ("❄️ Snow grains", 0xDCDCDC),
+            80: ("🌧️ Slight rain showers", 0x4169E1),
+            81: ("🌧️ Moderate rain showers", 0x1E90FF),
+            82: ("⛈️ Violent rain showers", 0x00008B),
+            85: ("❄️ Slight snow showers", 0xDCDCDC),
+            86: ("❄️ Heavy snow showers", 0xB0E0E6),
+            95: ("⛈️ Thunderstorm", 0xFF6347),
+            96: ("⛈️ Thunderstorm with slight hail", 0xFF4500),
+            99: ("⛈️ Thunderstorm with heavy hail", 0xFF0000),
+        }
+
+        # Open-Meteo uses 'weathercode' in current_weather
+        weather_code = current.get("weathercode", 0)
+        weather_desc, color = weather_codes.get(weather_code, ("🌍 Unknown", 0x808080))
+
+        temp = current.get("temperature", "N/A")
+        feels_like = current.get("apparent_temperature", "N/A")
+        # Open-Meteo may not provide humidity in current_weather; default to N/A
+        humidity = current.get("relativehumidity", current.get("relative_humidity", "N/A"))
+        wind_speed = current.get("windspeed", current.get("wind_speed_10m", "N/A"))
+        wind_dir = current.get("winddirection", current.get("wind_direction_10m", "N/A"))
+
+        # Format location string
+        location_str = city_name
+        if admin:
+            location_str += f", {admin}"
+        if country:
+            location_str += f", {country}"
+
+        # Create embed
+        embed = discord.Embed(
+            title=f"{weather_desc}",
+            description=f"Weather for {location_str}",
+            color=color,
+            timestamp=discord.utils.utcnow(),
+        )
+
+        embed.add_field(
+            name="🌡️ Temperature",
+            value=f"**{temp}°F**\nFeels like: {feels_like}°F",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="💧 Humidity",
+            value=f"**{humidity}%**",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="💨 Wind",
+            value=f"**{wind_speed} mph**\nDirection: {wind_dir}°",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="📍 Coordinates",
+            value=f"Lat: {latitude}°\nLon: {longitude}°",
+            inline=False,
+        )
+
+        embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print(f"[ERROR] Weather command error: {e}")
+        try:
+            await interaction.followup.send("❌ An error occurred while fetching weather data.", ephemeral=True)
+        except Exception:
+            pass
 
 
 @bot.tree.command(name="blacklist", description="Manage the server blacklist (admins only)")
