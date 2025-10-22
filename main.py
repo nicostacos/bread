@@ -4111,6 +4111,210 @@ async def lock(
         )
 
 
+@bot.tree.command(name="lockdown", description="Completely lock a channel (slash command)")
+@app_commands.describe(
+    channel="Channel to completely lock (current channel if not specified)"
+)
+async def slash_completelock(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel = None
+):
+    """Completely lock a channel (slash command)"""
+    if not channel:
+        channel = interaction.channel
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ You need administrator permissions to use this command!",
+            ephemeral=True,
+        )
+        return
+    if not interaction.guild.me.guild_permissions.manage_channels:
+        await interaction.response.send_message(
+            "❌ I don't have permission to modify channels!", ephemeral=True
+        )
+        return
+    
+    # Build a dictionary of overwrites for all roles
+    overwrites = {}
+    
+    # Lock down @everyone
+    overwrites[interaction.guild.default_role] = discord.PermissionOverwrite(
+        send_messages=False,
+        create_public_threads=False,
+        create_private_threads=False,
+        add_reactions=False
+    )
+    
+    # Process all other roles
+    for role in interaction.guild.roles:
+        # Skip @everyone since we already handled it
+        if role == interaction.guild.default_role:
+            continue
+            
+        # Check if role has admin or manage_messages permissions
+        if role.permissions.administrator or role.permissions.manage_messages:
+            # Allow these roles to bypass the lockdown
+            overwrites[role] = discord.PermissionOverwrite(
+                send_messages=True,
+                create_public_threads=True,
+                create_private_threads=True,
+                add_reactions=True
+            )
+        else:
+            # Lock down all other roles
+            overwrites[role] = discord.PermissionOverwrite(
+                send_messages=False,
+                create_public_threads=False,
+                create_private_threads=False,
+                add_reactions=False
+            )
+
+    await channel.edit(overwrites=overwrites)
+
+    await send_mod_log(
+        guild=interaction.guild,
+        title="🔒 Channel Completely Locked",
+        description=f"{channel.mention} has been completely locked.",
+        color=0xFF0000,
+        fields=[
+            ("Channel", channel.mention, True),
+            ("Moderator", interaction.user.mention, True),
+        ],
+    )
+    await interaction.response.send_message(
+        f"✅ {channel.mention} has been completely locked! Only administrators and roles with Manage Messages can interact.",
+        ephemeral=True,
+    )
+
+@bot.tree.command(name="unlockdown", description="Completely unlock a channel (slash command)")
+@app_commands.describe(
+    channel="Channel to completely unlock (current channel if not specified)"
+)
+async def slash_completeunlock(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel = None
+):
+    """Completely unlock a channel (slash command)"""
+    if not channel:
+        channel = interaction.channel
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ You need administrator permissions to use this command!",
+            ephemeral=True,
+        )
+        return
+    if not interaction.guild.me.guild_permissions.manage_channels:
+        await interaction.response.send_message(
+            "❌ I don't have permission to modify channels!", ephemeral=True
+        )
+        return
+    
+    # Build a dictionary of overwrites for all roles
+    overwrites = {}
+    
+    # Unlock @everyone
+    overwrites[interaction.guild.default_role] = discord.PermissionOverwrite(
+        send_messages=True,
+        create_public_threads=True,
+        create_private_threads=True,
+        add_reactions=True
+    )
+    
+    # Process all other roles
+    for role in interaction.guild.roles:
+        # Skip @everyone since we already handled it
+        if role == interaction.guild.default_role:
+            continue
+            
+        # Check if role has admin or manage_messages permissions
+        if role.permissions.administrator or role.permissions.manage_messages:
+            # Allow these roles to send messages
+            overwrites[role] = discord.PermissionOverwrite(
+                send_messages=True,
+                create_public_threads=True,
+                create_private_threads=True,
+                add_reactions=True
+            )
+        else:
+            # Unlock all other roles
+            overwrites[role] = discord.PermissionOverwrite(
+                send_messages=True,
+                create_public_threads=True,
+                create_private_threads=True,
+                add_reactions=True
+            )
+
+    await channel.edit(overwrites=overwrites)
+
+    await send_mod_log(
+        guild=interaction.guild,
+        title="🔓 Channel Completely Unlocked",
+        description=f"{channel.mention} has been completely unlocked.",
+        color=0x00FF00,
+        fields=[
+            ("Channel", channel.mention, True),
+            ("Moderator", interaction.user.mention, True),
+        ],
+    )
+    await interaction.response.send_message(
+        f"✅ {channel.mention} has been completely unlocked!",
+        ephemeral=True,
+    )
+
+
+@bot.command(name="unlockdown", aliases=["unlockcompletely"])
+@commands.has_permissions(administrator=True)
+async def unlockdown(ctx, channel: discord.TextChannel = None):
+    """Completely unlock a channel for everyone"""
+    if not channel or not isinstance(channel, discord.TextChannel):
+        await ctx.send("❌ Please specify a valid text channel to unlock completely!")
+        return
+
+    # Base overwrite for everyone
+    everyone_role = ctx.guild.default_role
+    overwrites = channel.overwrites.copy()  # Copy current overwrites
+
+    # Unlock for @everyone
+    overwrites[everyone_role] = discord.PermissionOverwrite(
+        send_messages=True,
+        create_public_threads=True,
+        create_private_threads=True,
+        add_reactions=True
+    )
+
+    # Unlock for other non-admin roles
+    for role in ctx.guild.roles:
+        if role.permissions.administrator or role.permissions.manage_messages:
+            continue
+        overwrites[role] = discord.PermissionOverwrite(
+            send_messages=True,
+            create_public_threads=True,
+            create_private_threads=True,
+            add_reactions=True
+        )
+
+    await channel.edit(overwrites=overwrites)
+
+    embed = discord.Embed(
+        title="🔓 Channel Completely Unlocked",
+        description=f"{channel.mention} has been completely unlocked.",
+        color=0x00FF00,
+    )
+    embed.add_field(name="Moderator", value=ctx.author.mention, inline=False)
+    await ctx.send(embed=embed)
+
+    await send_mod_log(
+        guild=ctx.guild,
+        title="🔓 Channel Completely Unlocked",
+        description=f"{channel.mention} has been completely unlocked.",
+        color=0x00FF00,
+        fields=[
+            ("Channel", channel.mention, True),
+            ("Moderator", ctx.author.mention, True),
+        ],
+    )
+
+
 @bot.tree.command(
     name="unlock", description="Unlock a channel to allow members to send messages"
 )
@@ -4462,6 +4666,64 @@ async def unlock(
             ],
         )
 
+@bot.command(name="lockdown", aliases=["completelock"])
+@commands.has_permissions(administrator=True)
+async def completelock(ctx, channel: discord.TextChannel = None):
+    if not channel or not isinstance(channel, discord.TextChannel):
+        await ctx.send("❌ Please specify a valid text channel to lock completely!")
+        return
+
+    # Build a dictionary of overwrites for all roles
+    overwrites = {}
+    
+    # Lock down @everyone
+    overwrites[ctx.guild.default_role] = discord.PermissionOverwrite(
+        send_messages=False,
+        create_public_threads=False,
+        create_private_threads=False,
+        add_reactions=False
+    )
+    
+    # Process all other roles
+    for role in ctx.guild.roles:
+        # Skip @everyone since we already handled it
+        if role == ctx.guild.default_role:
+            continue
+            
+        # Check if role has admin or manage_messages permissions
+        if role.permissions.administrator or role.permissions.manage_messages:
+            # Allow these roles to bypass the lockdown
+            overwrites[role] = discord.PermissionOverwrite(
+                send_messages=True,
+                create_public_threads=True,
+                create_private_threads=True,
+                add_reactions=True
+            )
+        else:
+            # Lock down all other roles
+            overwrites[role] = discord.PermissionOverwrite(
+                send_messages=False,
+                create_public_threads=False,
+                create_private_threads=False,
+                add_reactions=False
+            )
+
+    await channel.edit(overwrites=overwrites)
+
+    await send_mod_log(
+        guild=ctx.guild,
+        title="🔒 Channel Completely Locked",
+        description=f"{channel.mention} has been completely locked.",
+        color=0xFF0000,
+        fields=[
+            ("Channel", channel.mention, True),
+            ("Moderator", ctx.author.mention, True),
+        ],
+    )
+    await ctx.send(f"✅ {channel.mention} has been completely locked! Only administrators and roles with Manage Messages can interact.")
+
+
+    
 
 @bot.command()
 @commands.is_owner()
@@ -4493,5 +4755,5 @@ async def lalala(ctx):
 flask_thread = threading.Thread(target=run_flask)
 flask_thread.daemon = True
 flask_thread.start()
-
+print("hello world")
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
