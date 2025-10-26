@@ -21,7 +21,7 @@ from flask import Flask
 # --- MongoDB Setup
 
 load_dotenv()
-
+API_KEY = os.getenv("API_KEY")
 mongo_user = os.getenv("MONGO_USER")
 mongo_pass = os.getenv("MONGO_PASS")
 mongo_db = os.getenv("MONGO_DB")
@@ -747,6 +747,78 @@ async def automod(interaction: discord.Interaction, action: str):
         else:
             await interaction.response.send_message("❌ Failed to delete AutoMod rule. Check logs.", ephemeral=True)
 
+@bot.command()
+@commands.has_permissions(send_messages=True)
+async def qoute(ctx):
+    url = "https://api.api-ninjas.com/v1/quotes"
+    headers = {"X-Api-Key": API_KEY}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        quote_data = data[0]
+                        if quote_data and "quote" in quote_data and "author" in quote_data:
+                            quote = quote_data["quote"]
+                            author = quote_data["author"]
+                            if quote and author:
+                                embed = discord.Embed(
+                                    title="📜 Daily Quote",
+                                    description=f"“{quote}”",
+                                    color=discord.Color.blue()
+                                )
+                                embed.set_footer(text=f"— {author}")
+                                await ctx.send(embed=embed)
+                                return
+                        await ctx.send("❌ Couldn't find a valid quote right now.")
+                    else:
+                        await ctx.send(f"❌ Invalid API response (status: {response.status}).")
+                else:
+                    await ctx.send(f"❌ Failed to fetch quote (status: {response.status}).")
+    except (aiohttp.ClientError, discord.Forbidden, discord.HTTPException) as e:
+        await ctx.send(f"❌ An error occurred: {e}")
+    except Exception as e:
+        await ctx.send(f"❌ An unexpected error occurred: {e}")
+        traceback.print_exc()
+
+
+
+@bot.tree.command(name="qoute", description="Says A random qoute")
+async def qoute(interaction: discord.Interaction):
+    url = "https://api.api-ninjas.com/v1/quotes"
+    headers = {"X-Api-Key": API_KEY}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if not isinstance(data, list) or len(data) == 0:
+                        await interaction.response.send_message("❌ Couldn't find a valid quote right now.")
+                        return
+                    quote_data = data[0]
+                    if not isinstance(quote_data, dict):
+                        await interaction.response.send_message("❌ Malformed data received from API.")
+                        return
+                    quote = quote_data.get("quote")
+                    author = quote_data.get("author")
+                    if not quote or not author:
+                        await interaction.response.send_message("❌ Malformed data received from API.")
+                        return
+                    embed = discord.Embed(
+                        title="📜 Daily Quote",
+                        description=f"“{quote}”",
+                        color=discord.Color.blue()
+                    )
+                    embed.set_footer(text=f"— {author}")
+                    await interaction.response.send_message(embed=embed)
+                else:
+                    await interaction.response.send_message(f"❌ Failed to fetch quote (status: {response.status}).")
+    except (aiohttp.ClientError, discord.Forbidden, discord.HTTPException) as e:
+        await interaction.response.send_message(f"❌ An error occurred: {e}")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ An unexpected error occurred: {e}")
+        traceback.print_exc()
 
 @bot.command(name="automod", aliases=["am", "auto-mod"]) 
 @commands.has_permissions(manage_guild=True)
@@ -4571,6 +4643,7 @@ async def lock(
                 ("Channel", target_channel.mention, True),
             ],
         )
+
 
 
 @bot.command()
