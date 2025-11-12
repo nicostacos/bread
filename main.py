@@ -7,7 +7,11 @@ import datetime
 import asyncio
 import traceback
 import threading
-import aiohttp
+try:
+    import aiohttp
+except ImportError:
+    print("❌ Missing dependency: aiohttp. Install with: pip install aiohttp")
+    raise
 import asyncio
 from pymongo import MongoClient
 # from webhook_utils import send_webhook_message
@@ -751,7 +755,7 @@ async def automod(interaction: discord.Interaction, action: str):
 @commands.has_permissions(send_messages=True)
 async def qoute(ctx):
     url = "https://api.api-ninjas.com/v1/quotes"
-    headers = {"X-Api-Key": API_KEY}
+    headers = {"X-Api-Key": API_KEY} if API_KEY else {}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as response:
@@ -768,7 +772,7 @@ async def qoute(ctx):
                                     description=f"“{quote}”",
                                     color=discord.Color.blue()
                                 )
-                                embed.set_footer(text=f"— {author}")
+                                embed.set_footer(text=f"— {str(author)}")
                                 await ctx.send(embed=embed)
                                 return
                         await ctx.send("❌ Couldn't find a valid quote right now.")
@@ -787,7 +791,7 @@ async def qoute(ctx):
 @bot.tree.command(name="qoute", description="Says A random qoute")
 async def qoute(interaction: discord.Interaction):
     url = "https://api.api-ninjas.com/v1/quotes"
-    headers = {"X-Api-Key": API_KEY}
+    headers = {"X-Api-Key": API_KEY} if API_KEY else {}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as response:
@@ -810,7 +814,7 @@ async def qoute(interaction: discord.Interaction):
                         description=f"“{quote}”",
                         color=discord.Color.blue()
                     )
-                    embed.set_footer(text=f"— {author}")
+                    embed.set_footer(text=f"— {str(author)}")
                     await interaction.response.send_message(embed=embed)
                 else:
                     await interaction.response.send_message(f"❌ Failed to fetch quote (status: {response.status}).")
