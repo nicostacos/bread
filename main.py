@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask
+from io import BytesIO
+
 
 # --- MongoDB Setup
 
@@ -210,23 +212,7 @@ def set_filter_enabled(guild_id, enabled: bool):
         return False
 
 
-def debug_filter_db():
-    """Debug function to print all filter documents"""
-    global filter_collection
-    print("\n=== DEBUG: MongoDB Filter Collection ===")
-    for doc in filter_collection.find():
-        print(
-            f"Guild {doc.get('guild_id')}: {len(doc.get('filter_words', []))} words, enabled: {doc.get('enabled', True)}"
-        )
-    print("=== End of Filter Debug ===\n")
 
-
-def debug_db():
-    """Debug function to print all documents in the config collection"""
-    print("\n=== DEBUG: MongoDB Config Collection ===")
-    for doc in config_collection.find():
-        print(f"Document: {doc}")
-    print("=== End of MongoDB Debug ===\n")
 
 
 def _coerce_embed_value(val):
@@ -874,7 +860,7 @@ async def initialize_apod_cache():
     """Initialize the APOD cache at startup."""
     print("🌌 Initializing APOD cache...")
     try:
-        embed = await fetch_nasa_apod(use_cache=False)
+        embed, file = await fetch_nasa_apod(use_cache=False)
         print("✅ Successfully initialized APOD cache")
         return embed
     except Exception as e:
@@ -884,7 +870,7 @@ async def initialize_apod_cache():
 @bot.event
 async def setup_hook():
     tasks = [
-        asyncio.create_task(keep_alive_task(), name="keep_alive"),
+        # asyncio.create_task(keep_alive_task(), name="keep_alive"),
         asyncio.create_task(initialize_apod_cache(), name="init_apod"),
     ]
     bot.background_task = tasks[0]  # Keep reference for backward compatibility
@@ -931,8 +917,6 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         print(f"✅ Synced {len(synced)} global commands: {[cmd.name for cmd in synced]}")
-        # Print debug info on startup
-        debug_db()
     except Exception as e:
         print(f"❌ Failed to sync commands: {e}")
 
@@ -3906,7 +3890,19 @@ async def fetch_nasa_apod(use_cache=False):
         # Cache is valid for 24 hours
         cache_age = (discord.utils.utcnow() - _nasa_apod_cache_time).total_seconds()
         if cache_age < 86400:  # 24 hours in seconds
-            return _nasa_apod_cache
+            # _nasa_apod_cache may be stored as (embed, image_bytes) or just embed
+            cache_entry = _nasa_apod_cache
+            if isinstance(cache_entry, tuple) and len(cache_entry) == 2:
+                cached_embed, cached_bytes = cache_entry
+                if cached_bytes:
+                    try:
+                        file = discord.File(fp=BytesIO(cached_bytes), filename="apod.jpg")
+                        return cached_embed, file
+                    except Exception:
+                        return cached_embed, None
+                return cached_embed, None
+            else:
+                return cache_entry, None
     
     try:
         nasa_api_key = os.getenv("NASA_API_KEY")
@@ -3943,6 +3939,14 @@ async def fetch_nasa_apod(use_cache=False):
             timestamp=discord.utils.utcnow(),
         )
 
+        # Always add an HD/source link field when available so users can open the image
+        if hd_url:
+            try:
+                embed.add_field(name="🔍 HD Version", value=f"[Click here]({hd_url})", inline=True)
+            except Exception:
+                # If embedding the markdown link fails for any client, add a plain URL fallback
+                embed.add_field(name="🔍 HD Version", value=hd_url, inline=True)
+
         if media_type == "image" and image_url:
             async with aiohttp.ClientSession() as session:
                 async with session.get(image_url) as img_resp:
@@ -3959,18 +3963,30 @@ async def fetch_nasa_apod(use_cache=False):
                         raise e
                     embed.set_image(url="attachment://apod.jpg")
                     embed.add_field(name="🔍 HD Version", value=f"[Click here]({hd_url})", inline=True)
+                    # Cache embed and raw bytes so we can reattach later
+                    _nasa_apod_cache = (embed, img_data)
                     return embed, file
         elif media_type == "video" and image_url:
-            embed.add_field(name="🎥 Video Link", value=f"[Watch Video]({image_url})", inline=False)
+            # For videos, include a watch link and set thumbnail if possible
+            try:
+                embed.add_field(name="🎥 Video Link", value=f"[Watch Video]({image_url})", inline=False)
+            except Exception:
+                embed.add_field(name="🎥 Video Link", value=image_url, inline=False)
+
+        # If we didn't attach an image (image branch would have returned already), set the image URL so Discord can preview it
+        try:
+            if image_url:
+                embed.set_image(url=image_url)
+        except Exception:
+            pass
 
         embed.add_field(name="📅 Date", value=date, inline=True)
         embed.add_field(name="©️ Credit", value=credit, inline=True)
 
-        # Cache the embed
-        global_nasa_apod_cache
-        _nasa_apod_cache = embed
-        
-        return embed
+        # Cache the embed (no attached image bytes)
+        _nasa_apod_cache = (embed, None)
+
+        return embed, None
     except Exception as e:
         print("[ERROR] Exception in fetch_nasa_apod function:")
         traceback.print_exc()
@@ -4009,9 +4025,9 @@ async def apod_cache_cmd(ctx):
     embed.add_field(name="©️ Credit", value=sample_data["copyright"], inline=True)
 
     global _nasa_apod_cache, _nasa_apod_cache_time
-    _nasa_apod_cache = embed
+    _nasa_apod_cache = (embed, None)
     _nasa_apod_cache_time = discord.utils.utcnow()
-    
+
     await ctx.send("✅ Added sample APOD to cache! Testing cache now...", embed=embed)
     
 @bot.command(name="apod", aliases=["nasa", "space_pic"]) 
@@ -4021,7 +4037,7 @@ async def apod_cmd(ctx):
         async with ctx.typing():
             last_exc = None
             try:
-                embed = await fetch_nasa_apod(use_cache=False)
+                embed, file = await fetch_nasa_apod(use_cache=False)
                 last_exc = None
             except Exception as e:
                 last_exc = e
@@ -4030,7 +4046,7 @@ async def apod_cmd(ctx):
                 except Exception:
                     pass
                 try:
-                    embed = await fetch_nasa_apod(use_cache=True)
+                    embed, file = await fetch_nasa_apod(use_cache=True)
                     last_exc = None
                 except Exception as e:
                     last_exc = e
@@ -4040,7 +4056,10 @@ async def apod_cmd(ctx):
                 return
 
             embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
-            await ctx.send(embed=embed)
+            if file:
+                await ctx.send(embed=embed, file=file)
+            else:
+                await ctx.send(embed=embed)
     except Exception as e:
         await ctx.send(f"❌ {e}")
 
@@ -4078,9 +4097,9 @@ async def apod_cache_slash(interaction: discord.Interaction):
     embed.add_field(name="©️ Credit", value=sample_data["copyright"], inline=True)
 
     global _nasa_apod_cache, _nasa_apod_cache_time
-    _nasa_apod_cache = embed
+    _nasa_apod_cache = (embed, None)
     _nasa_apod_cache_time = discord.utils.utcnow()
-    
+
     await interaction.followup.send("✅ Added sample APOD to cache! Testing cache now...", embed=embed)
 
 @bot.tree.command(name="apod", description="Get NASA's Astronomy Picture of the Day")
@@ -4089,7 +4108,7 @@ async def apod_slash(interaction: discord.Interaction):
     try:
         last_exc = None
         try:
-            embed = await fetch_nasa_apod(use_cache=False)
+            embed, file = await fetch_nasa_apod(use_cache=False)
             last_exc = None
         except Exception as e:
             last_exc = e
@@ -4098,7 +4117,7 @@ async def apod_slash(interaction: discord.Interaction):
             except Exception:
                 pass
             try:
-                embed = await fetch_nasa_apod(use_cache=True)
+                embed, file = await fetch_nasa_apod(use_cache=True)
                 last_exc = None
             except Exception as e:
                 last_exc = e
@@ -4108,7 +4127,10 @@ async def apod_slash(interaction: discord.Interaction):
             return
 
         embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
-        await interaction.followup.send(embed=embed)
+        if file:
+            await interaction.followup.send(embed=embed, file=file)
+        else:
+            await interaction.followup.send(embed=embed)
     except Exception as e:
         await interaction.followup.send(f"❌ {e}", ephemeral=True)
 
