@@ -21,6 +21,7 @@ from discord import app_commands
 from discord.ext import commands
 from flask import Flask
 from io import BytesIO
+from typing import Optional, Any, List, Tuple, cast
 
 
 # --- MongoDB Setup
@@ -35,7 +36,7 @@ mongo_host = os.getenv("MONGO_HOST")
 mongo_uri = f"mongodb+srv://{mongo_user}:{mongo_pass}@{mongo_host}/{mongo_db}?retryWrites=true&w=majority"
 
 client = MongoClient(mongo_uri)
-db = client[mongo_db]
+db = client[mongo_db] # type: ignore
 config_collection = db[
     "server_configs"
 ]
@@ -811,7 +812,7 @@ async def qoute(interaction: discord.Interaction):
 
 @bot.command(name="automod", aliases=["am", "auto-mod"]) 
 @commands.has_permissions(manage_guild=True)
-async def automod_cmd(ctx, action: str = None):
+async def automod_cmd(ctx, action: Optional[str] = None):
     if not action:
         await ctx.send("❌ Please specify `enable` or `disable`")
         return
@@ -870,7 +871,6 @@ async def initialize_apod_cache():
 @bot.event
 async def setup_hook():
     tasks = [
-        # asyncio.create_task(keep_alive_task(), name="keep_alive"),
         asyncio.create_task(initialize_apod_cache(), name="init_apod"),
     ]
     bot.background_task = tasks[0]  # Keep reference for backward compatibility
@@ -893,15 +893,15 @@ async def setup_hook():
         
     # Wait for cache initialization
     try:
-        await asyncio.wait([tasks[1]], timeout=30)  # Wait up to 30 seconds for cache init
+        await asyncio.wait([tasks[0]], timeout=30)  # Wait up to 30 seconds for cache init
     except Exception as e:
         print(f"[WARN] Error waiting for cache initialization: {e}")
     finally:
         # Clean up init task if it's still running
-        if not tasks[1].done():
-            tasks[1].cancel()
+        if not tasks[0].done():
+            tasks[0].cancel()
             try:
-                await tasks[1]
+                await tasks[0]
             except asyncio.CancelledError:
                 pass
 
@@ -931,9 +931,6 @@ except Exception as e:
 
 # Global blacklist only editable in source code
 GLOBAL_BLACKLIST = [
-  1400613835445899416, # Tray's main acc ##################### Pinkly #chloe's main acc
-  1420535411339563234, #Tray's alt  # Pinkly main
-
 ]
 
 BLACKLIST_BLOCK_MESSAGE = "You are banned from using this bot. If you think this is an mistake please contact either the server admins or the bot owner."
@@ -1439,7 +1436,7 @@ async def fetch_weather_embed(location: str) -> discord.Embed:
 
 
 @bot.command(name="weather")
-async def weather_cmd(ctx, *, location: str = None):
+async def weather_cmd(ctx, *, location: Optional[str] = None):
     """Prefix command: bread weather <location>
     If no location is provided, prompt the user with an embed asking for a location."""
     if not location or not location.strip():
@@ -1472,7 +1469,7 @@ async def weather_cmd(ctx, *, location: str = None):
 @app_commands.describe(action="add/remove/list", user="User to add/remove")
 @app_commands.choices(action=[app_commands.Choice(name="add", value="add"), app_commands.Choice(name="remove", value="remove"), app_commands.Choice(name="list", value="list")])
 @commands.has_permissions(administrator=True)
-async def blacklist(interaction: discord.Interaction, action: str, user: discord.Member = None):
+async def blacklist(interaction: discord.Interaction, action: str, user: Optional[discord.Member] = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permissions required", ephemeral=True)
         return
@@ -1557,7 +1554,7 @@ async def blacklist(interaction: discord.Interaction, action: str, user: discord
 
 @bot.command(name="blacklist", help="Manage server blacklist (admin only)")
 @commands.has_permissions(administrator=True)
-async def blacklist_cmd(ctx, action: str, user: discord.Member = None):
+async def blacklist_cmd(ctx, action: str, user: Optional[discord.Member] = None):
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("❌ Administrator permissions required")
         return
@@ -2245,13 +2242,13 @@ async def set_welcome_channel(
 
 
 async def send_mod_log(
-    guild: discord.Guild,
+    guild: Optional[discord.Guild],
     title: str,
     description: str,
     color: int,
-    fields: list = None,
-    thumbnail: str = None,
-):
+    fields: Optional[List[Tuple[str, str, bool]]] = None,
+    thumbnail: Optional[str] = None,
+) -> bool:
     """Helper function to send mod logs to the log channel"""
     global LOG_CHANNEL_ID
 
@@ -2307,7 +2304,21 @@ async def send_mod_log(
         except Exception:
             safe_embed = embed
 
-        await log_channel.send(embed=safe_embed)
+        # Ensure we have a channel-like object that supports send
+        if log_channel is None:
+            print("[WARN] No log channel resolved for send_mod_log")
+            return False
+        try:
+            # runtime: many channel types have send; narrow with hasattr to satisfy type-checkers
+            if hasattr(log_channel, "send"):
+                await cast(Any, log_channel).send(embed=safe_embed)
+                return True
+            else:
+                print("[WARN] log_channel does not support send()")
+                return False
+        except Exception as e:
+            print(f"[ERROR] send_mod_log send failed: {e}")
+            return False
         return True
     except Exception as e:
         print(f"Failed to send mod log: {e}")
@@ -2407,7 +2418,7 @@ async def on_message(message):
     ]
 )
 async def filter_command(
-    interaction: discord.Interaction, action: str, word: str = None
+    interaction: discord.Interaction, action: str, word: Optional[str] = None
 ):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message(
@@ -2833,7 +2844,7 @@ async def filter(ctx, action=None, *, word=None):
     help="Set the log channel for moderation logs",
 )
 @commands.has_permissions(manage_channels = True)
-async def setlog(ctx, channel: discord.TextChannel = None):
+async def setlog(ctx, channel: Optional[discord.TextChannel] = None):
     """Set the log channel for moderation logs (prefix command)"""
     if not channel:
         channel = ctx.channel
@@ -3215,7 +3226,7 @@ async def me(ctx):
 
 @bot.tree.command(name="help", description="Show bot commands and usage")
 @app_commands.describe(command="Specific command to get help for")
-async def slash_help(interaction: discord.Interaction, command: str = None):
+async def slash_help(interaction: discord.Interaction, command: Optional[str] = None):
     admin_commands = [
         "broadcast",
         "kick",
@@ -4521,49 +4532,51 @@ async def unban(ctx, user: discord.User, *, reason="No reason provided"):
 
 @bot.command()
 @commands.has_permissions(moderate_members=True)
-async def unmute(ctx, member: discord.Member, *, reason="No reason provided"):
+async def unmute(ctx, target: discord.Member, *, reason="No reason provided"):
     """Unmute a member (prefix command)"""
     if not ctx.guild.me.guild_permissions.moderate_members:
         await ctx.send("❌ I don't have permission to unmute members!")
         return
 
-    # Check if member is actually muted
-    if not member.is_timed_out():
-        await ctx.send(f"❌ {member.mention} is not muted!")
+    # Check if target is actually muted
+    # For discord.py 2.x, use the timed_out_until property to check if the member is muted
+    if not getattr(target, "timed_out_until", None) or (target.timed_out_until is not None and target.timed_out_until < discord.utils.utcnow()):
+        await ctx.send(f"❌ {target.mention} is not muted!")
         return
-
     try:
         # Send DM to the user before unmuting
         try:
-            await member.send(
+            await target.send(
                 f"You have been unmuted in **{ctx.guild.name}**.\nReason: {reason}"
             )
         except:
             pass  # User has DMs disabled or blocked the bot
 
-        # Remove the timeout
-        await member.timeout(None, reason=f"{reason} (unmuted by {ctx.author})")
-
-        # Send confirmation message
-        await ctx.send(f"✅ {member.mention} has been unmuted!\nReason: {reason}")
+        # Remove the timeout only if the member is actually muted
+        if target.timed_out_until and target.timed_out_until > discord.utils.utcnow():
+            await target.timeout(None, reason=f"{reason} (unmuted by {ctx.author})")
+            # Send confirmation message
+            await ctx.send(f"✅ {target.mention} has been unmuted!\nReason: {reason}")
+        else:
+            await ctx.send(f"ℹ️ {target.mention} is not currently muted.")
 
         # Log the unmute
         await send_mod_log(
             guild=ctx.guild,
             title="🔊 Member Unmuted",
-            description=f"{member.mention} has been unmuted.",
+            description=f"{target.mention} has been unmuted.",
             color=0x00FF00,
             fields=[
-                ("User", f"{member} ({member.id})", False),
+                ("User", f"{target} ({target.id})", False),
                 ("Moderator", ctx.author.mention, True),
                 ("Reason", reason, True),
                 (
                     "Account Created",
-                    discord.utils.format_dt(member.created_at, "R"),
+                    discord.utils.format_dt(target.created_at, "R"),
                     True,
                 ),
             ],
-            thumbnail=member.avatar.url if member.avatar else None,
+            thumbnail=target.avatar.url if target.avatar else "",
         )
 
     except discord.Forbidden:
@@ -4574,12 +4587,12 @@ async def unmute(ctx, member: discord.Member, *, reason="No reason provided"):
         await send_mod_log(
             guild=ctx.guild,
             title="❌ Unmute Failed",
-            description=f"Failed to unmute {member.mention}",
+            description=f"Failed to unmute {target.mention}",
             color=0xFF0000,
             fields=[
                 ("Error", str(e), False),
                 ("Moderator", ctx.author.mention, True),
-                ("Target", f"{member} ({member.id})", True),
+                ("Target", f"{target} ({target.id})", True),
             ],
         )
 
@@ -4855,3 +4868,4 @@ flask_thread.daemon = True
 flask_thread.start()
 print("hello world")
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
+
