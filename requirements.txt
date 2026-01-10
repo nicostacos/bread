@@ -4,7 +4,4 @@ flask>=2.3.3
 pymongo>=4.5.0
 dnspython>=2.4.2
 requests>=2.31.0
-aiohttp~=3.12.15
-
-
-# like this one?? ping if u do litterally i have one fucking file 
+aiohttp>=3.13.3
