@@ -221,7 +221,6 @@ def _coerce_embed_value(val):
     Acceptable types: str, int, float. For None or other types, return a safe string.
     """
     try:
-        # Handle booleans explicitly first because bool is a subclass of int
         if isinstance(val, bool):
             return "True" if val else "False"
 
@@ -230,7 +229,6 @@ def _coerce_embed_value(val):
 
         if isinstance(val, (str, int, float)):
             return val
-        # Fallback: convert to string
         return str(val)
     except Exception:
         return "N/A"
@@ -241,37 +239,28 @@ def sanitize_embed(original: discord.Embed) -> discord.Embed:
     This rebuilds the embed to avoid discord.py validation errors at send time.
     """
     try:
-        # Extract base properties
         title = getattr(original, "title", None)
         description = getattr(original, "description", None)
         color = getattr(original, "color", None)
         timestamp = getattr(original, "timestamp", None)
 
         new = discord.Embed(title=title, description=description, color=color, timestamp=timestamp)
-
-        # Footer
         try:
             if getattr(original, "footer", None) and getattr(original.footer, "text", None):
                 new.set_footer(text=original.footer.text, icon_url=getattr(original.footer, "icon_url", None))
         except Exception:
             pass
-
-        # Thumbnail
         try:
             if getattr(original, "thumbnail", None) and getattr(original.thumbnail, "url", None):
                 new.set_thumbnail(url=original.thumbnail.url)
         except Exception:
             pass
-
-        # Author (best-effort)
         try:
             auth = getattr(original, "author", None)
             if auth and getattr(auth, "name", None):
                 new.set_author(name=auth.name, icon_url=getattr(auth, "icon_url", None))
         except Exception:
             pass
-
-        # Fields: embed.fields is typically available
         fields = []
         try:
             fields = list(getattr(original, "fields", []) or [])
@@ -295,23 +284,16 @@ def sanitize_embed(original: discord.Embed) -> discord.Embed:
                 safe_value = _coerce_embed_value(value)
                 new.add_field(name=name, value=safe_value, inline=inline)
             except Exception:
-                # skip malformed field
                 continue
 
         return new
     except Exception as e:
         print(f"[WARN] sanitize_embed failed: {e}")
         return original
-
-
-# Monkey-patch discord.Embed.add_field to coerce values globally.
-# This ensures any call to add_field (from anywhere in this file) will not
-# raise an error if a bool or other unsupported type is passed.
 try:
     _orig_embed_add_field = discord.Embed.add_field
 
     def _safe_embed_add_field(self, *args, **kwargs):
-        # value can be passed as a kwarg or as the second positional arg
         try:
             if 'value' in kwargs:
                 kwargs['value'] = _coerce_embed_value(kwargs['value'])
@@ -319,7 +301,6 @@ try:
                 args = list(args)
                 args[1] = _coerce_embed_value(args[1])
         except Exception:
-            # fallback: replace with safe string
             if 'value' in kwargs:
                 kwargs['value'] = "N/A"
             elif len(args) >= 2:
@@ -331,8 +312,6 @@ try:
     discord.Embed.add_field = _safe_embed_add_field
 except Exception as e:
     print(f"[WARN] Could not monkey-patch discord.Embed.add_field: {e}")
-
-
 
 
 app = Flask(__name__)
@@ -359,11 +338,22 @@ def health():
 
 
 load_dotenv()
+
 token = os.getenv("DISCORD_TOKEN")
+
+
+if token:
+    if (token.startswith('"') and token.endswith('"')) or (token.startswith("'") and token.endswith("'")):
+        token = token[1:-1]
+    token = token.strip()
+    if token.startswith("Bot "):
+        token = token[len("Bot "):].strip()
+else:
+    print("❌ DISCORD_TOKEN not found in .env file. Please add it and try again.")
+    sys.exit(1)
 
 handler = logging.FileHandler(filename="discord.log", encoding="utf-8", mode="w")
 
-# Global variables for NASA APOD caching
 _nasa_apod_cache = None
 _nasa_apod_cache_time = None
 
@@ -387,13 +377,14 @@ PING_URL = "https://bread-bot-8rqr.onrender.com/"
 
 async def keep_alive_task():
     await bot.wait_until_ready()
-    channel = bot.get_channel(TIME_ID)
-
-    if channel is None:
-        print(f"❌ Could not find channel with ID {TIME_ID}")
-        return
-
     while not bot.is_closed():
+        channel = bot.get_channel(TIME_ID)
+
+        if channel is None:
+            print(f"❌ Could not find channel with ID {TIME_ID}; will retry every minute")
+            await asyncio.sleep(60)
+            continue
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(PING_URL) as resp:
@@ -418,7 +409,7 @@ async def keep_alive_task():
             await channel.send(embed=embed)
             print(f"[KeepAlive] Error: {e}")
 
-        await asyncio.sleep(300)  # every 5 minutes
+        await asyncio.sleep(60)
 
 def check_mongodb_connection():
     try:
@@ -451,19 +442,17 @@ async def _create_automod_rule_via_rest(guild: discord.Guild, keywords: list, al
 
     payload = {
         "name": "Bread Bot - AutoMod Filter",
-        "event_type": 1,  # MESSAGE_SEND
-        "trigger_type": 1,  # KEYWORD
-        # Discord expects keyword trigger metadata under the `keyword_filter` key
+        "event_type": 1,
+        "trigger_type": 1,
         "trigger_metadata": {"keyword_filter": keywords},
         "actions": [
-            {"type": 1},  # BLOCK_MESSAGE
-            {"type": 4, "metadata": {"channel_id": str(alert_channel_id)}},  # SEND_ALERT_MESSAGE
+            {"type": 1},
+            {"type": 4, "metadata": {"channel_id": str(alert_channel_id)}},
         ],
         "enabled": True,
     }
 
     try:
-        # Prefer discord.py HTTP client if available
         if hasattr(bot, "http") and hasattr(bot.http, "request"):
             try:
                 route = discord.http.Route("POST", "/guilds/{guild_id}/auto-moderation/rules", guild_id=guild.id)
@@ -472,8 +461,6 @@ async def _create_automod_rule_via_rest(guild: discord.Guild, keywords: list, al
                     return resp.get("id")
             except Exception:
                 pass
-
-        # Fallback to aiohttp
         async with aiohttp.ClientSession() as session:
             url = f"https://discord.com/api/v10/guilds/{guild.id}/auto-moderation/rules"
             headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
@@ -482,20 +469,15 @@ async def _create_automod_rule_via_rest(guild: discord.Guild, keywords: list, al
                     data = await r.json()
                     return data.get("id")
                 else:
-                    # Try to parse JSON error body to detect disallowed action types
                     try:
                         err_data = await r.json()
                     except Exception:
                         err_data = None
-
-                    # Log the original error body (string) for visibility
                     try:
                         txt = await r.text()
                     except Exception:
                         txt = str(err_data)
                     print(f"AutoMod create failed: {r.status} {txt}")
-
-                    # Detect AUTO_MODERATION_ACTION_TYPE_DISALLOWED anywhere in the error payload
                     def _contains_disallowed(obj):
                         if isinstance(obj, dict):
                             for k, v in obj.items():
@@ -513,7 +495,6 @@ async def _create_automod_rule_via_rest(guild: discord.Guild, keywords: list, al
 
                     if err_data and _contains_disallowed(err_data):
                         print("AutoMod create failed due to disallowed action type; retrying without alert action...")
-                        # Retry without the alert action (keep only BLOCK_MESSAGE)
                         payload_no_alert = {
                             "name": payload.get("name"),
                             "event_type": payload.get("event_type"),
@@ -570,7 +551,6 @@ async def _update_automod_rule_keywords_via_rest(guild: discord.Guild, rule_id: 
     """Update an existing automod rule's keyword list. If keywords is empty, delete the rule.
     Returns True on success (including deletion), False otherwise."""
     try:
-        # If there are no keywords left, delete the automod rule entirely
         if not keywords:
             print("No keywords left; deleting automod rule instead of updating")
             return await _delete_automod_rule_via_rest(guild, rule_id)
@@ -582,13 +562,10 @@ async def _update_automod_rule_keywords_via_rest(guild: discord.Guild, rule_id: 
             "trigger_metadata": {"keyword_filter": keywords},
             "enabled": True,
         }
-
-        # Try to preserve the alert action if an alert_channel_id was provided; otherwise attempt block-only.
         actions_with_alert = [{"type": 1}]
         if alert_channel_id:
             actions_with_alert.append({"type": 4, "metadata": {"channel_id": str(alert_channel_id)}})
 
-        # Attempt PATCH using discord.py http if available
         if hasattr(bot, "http") and hasattr(bot.http, "request"):
             try:
                 data_payload = dict(payload_base)
@@ -600,27 +577,21 @@ async def _update_automod_rule_keywords_via_rest(guild: discord.Guild, rule_id: 
             except Exception:
                 pass
 
-        # Fallback to aiohttp
         async with aiohttp.ClientSession() as session:
             url = f"https://discord.com/api/v10/guilds/{guild.id}/auto-moderation/rules/{rule_id}"
             headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-
-            # First try with alert action if provided
             first_payload = dict(payload_base)
             first_payload["actions"] = actions_with_alert if alert_channel_id else [{"type": 1}]
 
             async with session.patch(url, json=first_payload, headers=headers) as r:
                 if r.status in (200, 201):
                     return True
-                # parse error body
                 try:
                     err = await r.json()
                 except Exception:
                     err = None
                 txt = await r.text()
                 print(f"AutoMod update failed: {r.status} {txt}")
-
-                # detect disallowed action type and retry without alert action
                 def _contains_disallowed(obj):
                     if isinstance(obj, dict):
                         for k, v in obj.items():
@@ -872,8 +843,9 @@ async def initialize_apod_cache():
 async def setup_hook():
     tasks = [
         asyncio.create_task(initialize_apod_cache(), name="init_apod"),
+        asyncio.create_task(keep_alive_task(), name="keep_alive"),
     ]
-    bot.background_task = tasks[0]  # Keep reference for backward compatibility
+    bot.background_task = tasks[0] 
     
     print("Syncing application commands...")
     await bot.tree.sync()
@@ -890,14 +862,12 @@ async def setup_hook():
                     continue
     except Exception as e:
         print(f"[WARN] Could not register global slash check: {e}")
-        
-    # Wait for cache initialization
+
     try:
-        await asyncio.wait([tasks[0]], timeout=30)  # Wait up to 30 seconds for cache init
+        await asyncio.wait([tasks[0]], timeout=30)  
     except Exception as e:
         print(f"[WARN] Error waiting for cache initialization: {e}")
     finally:
-        # Clean up init task if it's still running
         if not tasks[0].done():
             tasks[0].cancel()
             try:
@@ -931,6 +901,7 @@ except Exception as e:
 
 # Global blacklist only editable in source code
 GLOBAL_BLACKLIST = [
+    1147879160782528593,
 ]
 
 BLACKLIST_BLOCK_MESSAGE = "You are banned from using this bot. If you think this is an mistake please contact either the server admins or the bot owner."
@@ -2150,62 +2121,6 @@ async def purge(interaction: discord.Interaction, limit: int = 2000):
         )
 
 
-@bot.tree.command(name="broadcast", description="Broadcast a message to all channels")
-@app_commands.describe(
-    message="The message to broadcast", ping_everyone="Whether to ping @everyone"
-)
-async def broadcast(
-    interaction: discord.Interaction, message: str, ping_everyone: bool = False
-):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "No one wants to hear you talking", ephemeral=False
-        )
-        return
-
-    if not interaction.guild.me.guild_permissions.send_messages:
-        await interaction.response.send_message(
-            "❌ I don't have permission to send messages!", ephemeral=True
-        )
-        return
-
-    try:
-        channel_count = 0
-        broadcast_message = f"@everyone {message}" if ping_everyone else message
-
-        for channel in interaction.guild.text_channels:
-            try:
-                await channel.send(broadcast_message)
-                channel_count += 1
-            except discord.Forbidden:
-                continue
-
-        ping_status = "with @everyone ping" if ping_everyone else "without ping"
-        await interaction.response.send_message(
-            f"✅ Broadcasted message to {channel_count} channels {ping_status}!",
-            ephemeral=True,
-        )
-        try:
-            await send_mod_log(
-                guild=interaction.guild,
-                title="📣 Broadcast Sent",
-                description=f"Broadcast sent by {interaction.user.mention} to {channel_count} channels ({ping_status}).",
-                color=0xF1C40F,
-                fields=[
-                    ("Moderator", interaction.user.mention, True),
-                    ("Channels Sent", str(channel_count), True),
-                    ("Ping Status", ping_status, True),
-                    ("Message", (message[:1024] + '...') if len(message) > 1024 else message, False),
-                ],
-            )
-        except Exception:
-            pass
-    except Exception as e:
-        await interaction.response.send_message(
-            f"❌ An error occurred: {e}", ephemeral=True
-        )
-
-
 @bot.tree.command(
     name="setwelcome", description="Set the welcome channel for new members"
 )
@@ -3038,7 +2953,6 @@ async def help(ctx, *, command_name=None):
             "getchannels": "`bread getchannels`\n`bread channels` (alternative)",
             "setchannel": "`bread setchannel #log-channel #welcome-channel`\n`bread setchannel #log-channel` (set only log)\n`bread setchannel` (use current channel for both)",
             "setlogchannel": "Alias for `setlog`",
-            "broadcast": "`bread broadcast Hello everyone!`\n`bread broadcast ping Important announcement!`",
         }
 
         if command.name in examples:
@@ -3132,7 +3046,6 @@ async def help(ctx, *, command_name=None):
             ),
             ("setwelcome [#channel]", "Set welcome channel for new members"),
             ("setlogchannel [#channel]", "Set channel for moderation logs"),
-            ("broadcast <message>", "Send a message to all text channels"),
         ]
 
         admin_text = "\n".join(
@@ -3228,7 +3141,6 @@ async def me(ctx):
 @app_commands.describe(command="Specific command to get help for")
 async def slash_help(interaction: discord.Interaction, command: Optional[str] = None):
     admin_commands = [
-        "broadcast",
         "kick",
         "ban",
         "mute",
@@ -3355,11 +3267,6 @@ async def slash_help(interaction: discord.Interaction, command: Optional[str] = 
                 "usage": "`/getchannels` or `bread getchannels`",
                 "example": "`/getchannels`\n`bread getchannels`",
             },
-            "broadcast": {
-                "description": "Send a message to all channels in the server",
-                "usage": "`/broadcast message:<text> [ping:<true/false>]` or `bread broadcast [message]`",
-                               "example": "`/broadcast message:Server restart in 5 minutes ping:true`\n`bread broadcast ping Server restart in 5 minutes`",
-            },
         }.get(command.lower())
 
         if not command_info:
@@ -3379,7 +3286,7 @@ async def slash_help(interaction: discord.Interaction, command: Optional[str] = 
         embed.add_field(name="Examples", value=command_info["example"], inline=False)
 
         # Add required permissions if any
-        if command.lower() in ["filter", "setwelcome", "setlogchannel", "broadcast", "setchannel"]:
+        if command.lower() in ["filter", "setwelcome", "setlogchannel", "setchannel"]:
             embed.add_field(
                 name="Required Permissions", value="Administrator", inline=False
             )
@@ -3496,10 +3403,6 @@ async def slash_help(interaction: discord.Interaction, command: Optional[str] = 
             (
                 "/setlogchannel [#channel] | bread setlogchannel [#channel]",
                 "Set the log channel (current channel if none specified)",
-            ),
-            (
-                "/broadcast [message] | bread broadcast [message]",
-                "Send a message to all channels",
             ),
             (
                 "/setchannel [#log] [#welcome]",
