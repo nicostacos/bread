@@ -29,7 +29,7 @@ class BreadBot(commands.Bot):
     async def setup_hook(self):
         """Setup hook for bot initialization"""
         from events.events import (
-            keep_alive_task, process_scheduled_invites, on_message, on_member_join,
+            keep_alive_task, process_scheduled_invites,
             setup_hook as events_setup_hook
         )
         
@@ -39,10 +39,6 @@ class BreadBot(commands.Bot):
         # Start background tasks
         self.background_task = asyncio.create_task(keep_alive_task(self))
         self.scheduled_invite_task = asyncio.create_task(process_scheduled_invites(self))
-        
-        # Register event listeners
-        self.add_listener(on_message, "on_message")
-        self.add_listener(on_member_join, "on_member_join")
         
         # Call events setup_hook
         await events_setup_hook(self)
@@ -134,6 +130,92 @@ async def on_ready():
         await debug_db()
     except Exception as e:
         print(f"❌ Failed to sync commands: {e}")
+
+
+# Message event - handle filtering and prefix commands
+@bot.event
+async def on_message(message):
+    """Handle message events including chat filtering"""
+    from events.events import global_prefix_block_check
+    from utils.config_manager import load_filter_words, get_filter_cache
+    from utils.helpers import send_mod_log
+    import re
+    from config import BLACKLIST_BLOCK_MESSAGE
+    
+    # Ignore messages from the bot itself
+    if message.author == bot.user:
+        return
+    
+    # Handle DMs
+    if isinstance(message.channel, discord.DMChannel):
+        if message.content.startswith("bread "):
+            await message.channel.send(
+                "Hello! You cannot use prefix commands in DMs, use slash commands instead."
+            )
+        return
+    
+    # Process prefix commands
+    if message.content.startswith("bread "):
+        # Check for blacklisted users before processing commands
+        try:
+            ctx = await bot.get_context(message)
+            await global_prefix_block_check(ctx)
+            await bot.process_commands(message)
+        except Exception:
+            pass
+        return
+    
+    # Filter messages in guilds
+    if message.guild:
+        guild_id = message.guild.id
+        guild_filter_words = await load_filter_words(guild_id)
+        _filter_cache = get_filter_cache()
+        filter_enabled = _filter_cache[guild_id][0]
+
+        if filter_enabled and guild_filter_words:
+            message_lower = message.content.lower()
+            # Create a regex pattern that matches any of the filter words
+            pattern = re.compile(r"\b" + "\b|\b".join(map(re.escape, guild_filter_words)) + "\b", re.IGNORECASE)
+            matches = pattern.findall(message_lower)
+
+            if matches:
+                try:
+                    await message.delete()
+                    embed = discord.Embed(
+                        title="🚫 Message Filtered",
+                        description=f"Your message contained forbidden words: {', '.join(set(matches))}",
+                        color=0xFF0000,
+                    )
+                    embed.add_field(name="Note", value="Repeated offenses may result in a kick or ban.", inline=False)
+                    try:
+                        await message.author.send(embed=embed)
+                    except discord.Forbidden:
+                        pass  # User has DMs disabled
+                    
+                    await send_mod_log(
+                        guild=message.guild,
+                        title="🚫 Message Filtered",
+                        description=f"{message.author.mention}'s message was filtered.",
+                        color=0xFF0000,
+                        fields=[
+                            ("User", f"{message.author} ({message.author.id})", False),
+                            ("Channel", message.channel.mention, True),
+                            ("Matched Words", ", ".join(set(matches)), True),
+                        ],
+                        thumbnail=(message.author.avatar.url if message.author.avatar else None),
+                    )
+                except discord.Forbidden:
+                    pass
+                except Exception as e:
+                    print(f"[ERROR] filtering message: {e}")
+
+
+# Member join event
+@bot.event
+async def on_member_join(member):
+    """Send welcome message to new members"""
+    from events.events import on_member_join as events_on_member_join
+    await events_on_member_join(member)
 
 
 # Guild remove event

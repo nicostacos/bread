@@ -192,66 +192,6 @@ async def process_scheduled_invites(bot):
         await asyncio.sleep(60)  # Check every minute
 
 
-async def on_message(message):
-    """Handle message events including chat filtering"""
-    if message.author == message.guild.me:
-        return
-
-    if isinstance(message.channel, discord.DMChannel):
-        if message.content.startswith("bread "):
-            await message.channel.send(
-                "Hello! You cannot use prefix commands in DMs, use slash commands instead."
-            )
-        return
-
-    if message.content.startswith("bread "):
-        # Process prefix commands
-        return
-
-    if message.guild:
-        guild_id = message.guild.id
-        guild_filter_words = await load_filter_words(guild_id)
-        _filter_cache = get_filter_cache()
-        filter_enabled = _filter_cache[guild_id][0]
-
-        if filter_enabled and guild_filter_words:
-            message_lower = message.content.lower()
-            # Create a regex pattern that matches any of the filter words
-            pattern = re.compile(r"\b" + "\b|\b".join(map(re.escape, guild_filter_words)) + "\b", re.IGNORECASE)
-            matches = pattern.findall(message_lower)
-
-            if matches:
-                try:
-                    await message.delete()
-                    embed = discord.Embed(
-                        title="🚫 Message Filtered",
-                        description=f"Your message contained forbidden words: {', '.join(set(matches))}",
-                        color=0xFF0000,
-                    )
-                    embed.add_field(name="Note", value="Repeated offenses may result in a kick or ban.", inline=False)
-                    try:
-                        await message.author.send(embed=embed)
-                    except discord.Forbidden:
-                        pass  # User has DMs disabled
-                    
-                    await send_mod_log(
-                        guild=message.guild,
-                        title="🚫 Message Filtered",
-                        description=f"{message.author.mention}'s message was filtered.",
-                        color=0xFF0000,
-                        fields=[
-                            ("User", f"{message.author} ({message.author.id})", False),
-                            ("Channel", message.channel.mention, True),
-                            ("Matched Words", ", ".join(set(matches)), True),
-                        ],
-                        thumbnail=(message.author.avatar.url if message.author.avatar else None),
-                    )
-                except discord.Forbidden:
-                    pass
-                except Exception as e:
-                    print(f"[ERROR] filtering message: {e}")
-
-
 async def on_member_join(member):
     """Send welcome message to new members"""
     try:
