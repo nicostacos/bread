@@ -192,9 +192,9 @@ async def process_scheduled_invites(bot):
         await asyncio.sleep(60)  # Check every minute
 
 
-async def on_message(bot, message):
+async def on_message(message):
     """Handle message events including chat filtering"""
-    if message.author == bot.user:
+    if message.author == message.guild.me:
         return
 
     if isinstance(message.channel, discord.DMChannel):
@@ -205,7 +205,7 @@ async def on_message(bot, message):
         return
 
     if message.content.startswith("bread "):
-        await bot.process_commands(message)
+        # Process prefix commands
         return
 
     if message.guild:
@@ -252,7 +252,7 @@ async def on_message(bot, message):
                     print(f"[ERROR] filtering message: {e}")
 
 
-async def on_member_join(bot, member):
+async def on_member_join(member):
     """Send welcome message to new members"""
     try:
         _, welcome_channel_id = await load_config(member.guild.id)
