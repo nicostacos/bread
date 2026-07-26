@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import threading
+import asyncio
 from flask import Flask
 import aiohttp
 
@@ -14,6 +15,40 @@ from config import DISCORD_TOKEN, BOT_OWNER_ID, FLASK_PORT
 
 # Initialize Flask app
 app = Flask(__name__)
+
+
+class BreadBot(commands.Bot):
+    """Custom bot class with setup_hook"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.aiohttp_session = None
+        self.background_task = None
+        self.scheduled_invite_task = None
+    
+    async def setup_hook(self):
+        """Setup hook for bot initialization"""
+        from events.events import (
+            keep_alive_task, process_scheduled_invites, on_message, on_member_join,
+            setup_hook as events_setup_hook
+        )
+        
+        # Set up aiohttp session
+        self.aiohttp_session = aiohttp.ClientSession()
+        
+        # Start background tasks
+        self.background_task = asyncio.create_task(keep_alive_task(self))
+        self.scheduled_invite_task = asyncio.create_task(process_scheduled_invites(self))
+        
+        # Register event listeners
+        self.add_listener(on_message, "on_message")
+        self.add_listener(on_member_join, "on_member_join")
+        
+        # Call events setup_hook
+        await events_setup_hook(self)
+        
+        print("Syncing application commands...")
+        await self.tree.sync()
 
 
 def run_flask():
@@ -48,7 +83,7 @@ intents.message_content = True
 intents.members = True
 
 # Initialize bot
-bot = commands.Bot(command_prefix="bread ", intents=intents, help_command=None)
+bot = BreadBot(command_prefix="bread ", intents=intents, help_command=None)
 
 # Set bot owner ID if configured
 try:
@@ -81,33 +116,6 @@ def load_cogs():
             print(f"❌ Failed to load cog {cog}: {e}")
 
 
-# Setup hook
-@bot.setup_hook
-async def bot_setup_hook():
-    """Setup hook for bot initialization"""
-    from events.events import (
-        keep_alive_task, process_scheduled_invites, on_message, on_member_join,
-        setup_hook as events_setup_hook, on_ready as events_on_ready
-    )
-    
-    # Set up aiohttp session
-    bot.aiohttp_session = aiohttp.ClientSession()
-    
-    # Start background tasks
-    bot.background_task = asyncio.create_task(keep_alive_task(bot))
-    bot.scheduled_invite_task = asyncio.create_task(process_scheduled_invites(bot))
-    
-    # Register event listeners
-    bot.add_listener(on_message, "on_message")
-    bot.add_listener(on_member_join, "on_member_join")
-    
-    # Call events setup_hook
-    await events_setup_hook(bot)
-    
-    print("Syncing application commands...")
-    await bot.tree.sync()
-
-
 # Ready event
 @bot.event
 async def on_ready():
@@ -138,8 +146,6 @@ async def on_guild_remove(guild):
 
 # Start the bot
 if __name__ == "__main__":
-    import asyncio
-    
     # Start Flask thread
     start_flask_thread()
     
