@@ -1,33 +1,25 @@
-import sys
-import discord
+import asyncio
+import datetime
 import logging
 import os
 import random
-import datetime
-import asyncio
-import traceback
+import sys
 import threading
-try:
-    import aiohttp
-except ImportError:
-    print("❌ Missing dependency: aiohttp. Install with: pip install aiohttp")
-    raise
-import asyncio
-from pymongo import MongoClient
+
 # from webhook_utils import send_webhook_message
 from datetime import timezone
-from dotenv import load_dotenv
+
+import aiohttp
+import discord
 from discord import app_commands
 from discord.ext import commands
+from dotenv import load_dotenv
 from flask import Flask
-from io import BytesIO
-from typing import Optional, Any, List, Tuple, cast
-
 
 # --- MongoDB Setup
 
 load_dotenv()
-API_KEY = os.getenv("API_KEY")
+
 mongo_user = os.getenv("MONGO_USER")
 mongo_pass = os.getenv("MONGO_PASS")
 mongo_db = os.getenv("MONGO_DB")
@@ -35,8 +27,8 @@ mongo_host = os.getenv("MONGO_HOST")
 
 mongo_uri = f"mongodb+srv://{mongo_user}:{mongo_pass}@{mongo_host}/{mongo_db}?retryWrites=true&w=majority"
 
-client = MongoClient(mongo_uri)
-db = client[mongo_db] # type: ignore
+client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5_000)
+db = client[mongo_db]
 config_collection = db[
     "server_configs"
 ]
@@ -48,6 +40,11 @@ except Exception as e:
     print(f"ℹ️ word_filters collection already exists or error creating: {e}")
 
 filter_collection = db["word_filters"]
+# Moderation state is kept separately from server configuration so warning
+# history and delayed re-invites survive restarts.
+warnings_collection = db["moderation_warnings"]
+moderation_cases_collection = db["moderation_cases"]
+scheduled_invites_collection = db["scheduled_invites"]
 
 try:
     filter_collection.create_index("guild_id", unique=True)
@@ -90,18 +87,32 @@ def check_mongodb_connection():
 
         return True
     except Exception as e:
-        print(f"❌ MongoDB Connection Error: {str(e)}")
+        print(f"❌ MongoDB Connection Error: {e!s}")
         return False
 
-
-check_mongodb_connection()
 
 LOG_CHANNEL_ID = None
 WELCOME_CHANNEL_ID = None
 
+# The message event runs for every message.  Cache per-guild settings so it
+# does not perform a synchronous MongoDB query for every incoming message.
+_filter_cache: dict[int, tuple[bool, tuple[str, ...]]] = {}
+
+async def on_guild_remove(guild):
+    """Clean up cache and database entries when the bot leaves a guild."""
+    guild_id = guild.id
+    _filter_cache.pop(guild_id, None)
+    config_collection.delete_one({"guild_id": guild_id})
+    automod_rule_id_collection.delete_one({"guild_id": guild_id})
+    filter_collection.delete_many({"guild_id": guild_id})
+    warnings_collection.delete_many({"guild_id": guild_id})
+    moderation_cases_collection.delete_many({"guild_id": guild_id})
+    scheduled_invites_collection.delete_many({"guild_id": guild_id})
+    blacklist_collection.delete_many({"guild_id": guild_id})
+
 
 def save_config(guild_id, log_channel=None, welcome_channel=None):
-    global config_collection  
+    global config_collection
     update_data = {}
     if log_channel is not None:
         update_data["log_channel"] = log_channel
@@ -115,7 +126,7 @@ def save_config(guild_id, log_channel=None, welcome_channel=None):
 
 
 def load_config(guild_id):
-    global config_collection 
+    global config_collection
     data = config_collection.find_one({"guild_id": guild_id})
     if data:
         return data.get("log_channel"), data.get("welcome_channel")
@@ -159,6 +170,19 @@ def save_filter_words(guild_id, words):
             {"$set": {"filter_words": words, "updated_at": datetime.datetime.now(timezone.utc)}},
             upsert=True,
         )
+        if result.acknowledged:
+            previous = _filter_cache.get(guild_id)
+            if previous is None:
+                existing = filter_collection.find_one(
+                    {"guild_id": guild_id}, {"enabled": 1}
+                )
+                enabled = bool(existing.get("enabled", True)) if existing else True
+            else:
+                enabled = previous[0]
+            _filter_cache[guild_id] = (
+                enabled,
+                tuple(words),
+            )
         return result.acknowledged
     except Exception as e:
         print(f"[ERROR] save_filter_words: {e}")
@@ -169,10 +193,14 @@ def load_filter_words(guild_id):
     """Load filter words for a specific guild from MongoDB"""
     try:
         guild_id = int(guild_id)
+        cached = _filter_cache.get(guild_id)
+        if cached is not None:
+            return list(cached[1])
         doc = filter_collection.find_one({"guild_id": guild_id})
-        if doc and "filter_words" in doc:
-            return [str(w).lower() for w in doc["filter_words"]]
-        return list(default_filter_words)  
+        words = [str(w).lower() for w in doc.get("filter_words", default_filter_words)] if doc else list(default_filter_words)
+        enabled = bool(doc.get("enabled", True)) if doc else True
+        _filter_cache[guild_id] = (enabled, tuple(words))
+        return list(words)
     except Exception as e:
         print(f"[ERROR] load_filter_words: {e}")
         return list(default_filter_words)
@@ -192,6 +220,7 @@ def reset_filter_words(guild_id):
             },
             upsert=True,
         )
+        _filter_cache[guild_id] = (True, tuple(default_filter_words))
         return list(default_filter_words)
     except Exception as e:
         print(f"[ERROR] reset_filter_words: {e}")
@@ -207,111 +236,34 @@ def set_filter_enabled(guild_id, enabled: bool):
             {"$set": {"enabled": bool(enabled), "updated_at": datetime.datetime.now(timezone.utc)}},
             upsert=True,
         )
+        cached = _filter_cache.get(guild_id)
+        words = cached[1] if cached else tuple(load_filter_words(guild_id))
+        _filter_cache[guild_id] = (bool(enabled), words)
         return True
     except Exception as e:
         print(f"[ERROR] set_filter_enabled: {e}")
         return False
 
 
+def debug_filter_db():
+    """Debug function to print all filter documents"""
+    global filter_collection
+    print("\n=== DEBUG: MongoDB Filter Collection ===")
+    for doc in filter_collection.find():
+        print(
+            f"Guild {doc.get('guild_id')}: {len(doc.get('filter_words', []))} words, enabled: {doc.get('enabled', True)}"
+        )
+    print("=== End of Filter Debug ===\n")
 
 
-
-def _coerce_embed_value(val):
-    """Coerce a value into a type discord.Embed will accept for a field value.
-    Acceptable types: str, int, float. For None or other types, return a safe string.
-    """
-    try:
-        if isinstance(val, bool):
-            return "True" if val else "False"
-
-        if val is None:
-            return "N/A"
-
-        if isinstance(val, (str, int, float)):
-            return val
-        return str(val)
-    except Exception:
-        return "N/A"
+def debug_db():
+    """Debug function to print all documents in the config collection"""
+    print("\n=== DEBUG: MongoDB Config Collection ===")
+    for doc in config_collection.find():
+        print(f"Document: {doc}")
+    print("=== End of MongoDB Debug ===\n")
 
 
-def sanitize_embed(original: discord.Embed) -> discord.Embed:
-    """Return a copy of the embed with all field values coerced to safe types.
-    This rebuilds the embed to avoid discord.py validation errors at send time.
-    """
-    try:
-        title = getattr(original, "title", None)
-        description = getattr(original, "description", None)
-        color = getattr(original, "color", None)
-        timestamp = getattr(original, "timestamp", None)
-
-        new = discord.Embed(title=title, description=description, color=color, timestamp=timestamp)
-        try:
-            if getattr(original, "footer", None) and getattr(original.footer, "text", None):
-                new.set_footer(text=original.footer.text, icon_url=getattr(original.footer, "icon_url", None))
-        except Exception:
-            pass
-        try:
-            if getattr(original, "thumbnail", None) and getattr(original.thumbnail, "url", None):
-                new.set_thumbnail(url=original.thumbnail.url)
-        except Exception:
-            pass
-        try:
-            auth = getattr(original, "author", None)
-            if auth and getattr(auth, "name", None):
-                new.set_author(name=auth.name, icon_url=getattr(auth, "icon_url", None))
-        except Exception:
-            pass
-        fields = []
-        try:
-            fields = list(getattr(original, "fields", []) or [])
-        except Exception:
-            try:
-                fields = list(getattr(original, "_fields", []) or [])
-            except Exception:
-                fields = []
-
-        for f in fields:
-            try:
-                if isinstance(f, dict):
-                    name = f.get("name")
-                    value = f.get("value")
-                    inline = f.get("inline", False)
-                else:
-                    name = getattr(f, "name", None)
-                    value = getattr(f, "value", None)
-                    inline = getattr(f, "inline", False)
-
-                safe_value = _coerce_embed_value(value)
-                new.add_field(name=name, value=safe_value, inline=inline)
-            except Exception:
-                continue
-
-        return new
-    except Exception as e:
-        print(f"[WARN] sanitize_embed failed: {e}")
-        return original
-try:
-    _orig_embed_add_field = discord.Embed.add_field
-
-    def _safe_embed_add_field(self, *args, **kwargs):
-        try:
-            if 'value' in kwargs:
-                kwargs['value'] = _coerce_embed_value(kwargs['value'])
-            elif len(args) >= 2:
-                args = list(args)
-                args[1] = _coerce_embed_value(args[1])
-        except Exception:
-            if 'value' in kwargs:
-                kwargs['value'] = "N/A"
-            elif len(args) >= 2:
-                args = list(args)
-                args[1] = "N/A"
-
-        return _orig_embed_add_field(self, *args, **kwargs)
-
-    discord.Embed.add_field = _safe_embed_add_field
-except Exception as e:
-    print(f"[WARN] Could not monkey-patch discord.Embed.add_field: {e}")
 
 
 app = Flask(__name__)
@@ -319,12 +271,13 @@ app = Flask(__name__)
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
-flask_thread = threading.Thread(target=run_flask)
-flask_thread.daemon = True
-flask_thread.start()
+def start_flask_thread():
+    thread = threading.Thread(target=run_flask, daemon=True, name="flask-health-server")
+    thread.start()
+    return thread
 
 
 @app.route("/")
@@ -338,30 +291,16 @@ def health():
 
 
 load_dotenv()
-
 token = os.getenv("DISCORD_TOKEN")
 
-
-if token:
-    if (token.startswith('"') and token.endswith('"')) or (token.startswith("'") and token.endswith("'")):
-        token = token[1:-1]
-    token = token.strip()
-    if token.startswith("Bot "):
-        token = token[len("Bot "):].strip()
-else:
-    print("❌ DISCORD_TOKEN not found in .env file. Please add it and try again.")
-    sys.exit(1)
-
-handler = logging.FileHandler(filename="discord.log", encoding="utf-8", mode="w")
-
-_nasa_apod_cache = None
-_nasa_apod_cache_time = None
+handler = logging.FileHandler(filename="discord.log", encoding="utf-8", mode="a")
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="bread ", intents=intents, help_command=None)
+bot_start_time = None
 
 
 try:
@@ -377,18 +316,16 @@ PING_URL = "https://bread-bot-8rqr.onrender.com/"
 
 async def keep_alive_task():
     await bot.wait_until_ready()
+    channel = bot.get_channel(TIME_ID)
+
+    if channel is None:
+        print(f"❌ Could not find channel with ID {TIME_ID}")
+        return
+
     while not bot.is_closed():
-        channel = bot.get_channel(TIME_ID)
-
-        if channel is None:
-            print(f"❌ Could not find channel with ID {TIME_ID}; will retry every minute")
-            await asyncio.sleep(60)
-            continue
-
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(PING_URL) as resp:
-                    status = resp.status
+            async with bot.aiohttp_session.get(PING_URL) as resp:
+                status = resp.status
             embed = discord.Embed(
                 title="🌐 Keep Alive Ping",
                 description=f"Pinged `{PING_URL}`",
@@ -408,8 +345,9 @@ async def keep_alive_task():
             embed.add_field(name="Error", value=str(e), inline=False)
             await channel.send(embed=embed)
             print(f"[KeepAlive] Error: {e}")
+        await asyncio.sleep(30)
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(300)  # every 5 minutes
 
 def check_mongodb_connection():
     try:
@@ -431,7 +369,7 @@ def check_mongodb_connection():
 
         return True
     except Exception as e:
-        print(f"❌ MongoDB Connection Error: {str(e)}")
+        print(f"❌ MongoDB Connection Error: {e!s}")
         return False
 
 
@@ -442,17 +380,19 @@ async def _create_automod_rule_via_rest(guild: discord.Guild, keywords: list, al
 
     payload = {
         "name": "Bread Bot - AutoMod Filter",
-        "event_type": 1,
-        "trigger_type": 1,
+        "event_type": 1,  # MESSAGE_SEND
+        "trigger_type": 1,  # KEYWORD
+        # Discord expects keyword trigger metadata under the `keyword_filter` key
         "trigger_metadata": {"keyword_filter": keywords},
         "actions": [
-            {"type": 1},
-            {"type": 4, "metadata": {"channel_id": str(alert_channel_id)}},
+            {"type": 1},  # BLOCK_MESSAGE
+            {"type": 4, "metadata": {"channel_id": str(alert_channel_id)}},  # SEND_ALERT_MESSAGE
         ],
         "enabled": True,
     }
 
     try:
+        # Prefer discord.py HTTP client if available
         if hasattr(bot, "http") and hasattr(bot.http, "request"):
             try:
                 route = discord.http.Route("POST", "/guilds/{guild_id}/auto-moderation/rules", guild_id=guild.id)
@@ -461,62 +401,69 @@ async def _create_automod_rule_via_rest(guild: discord.Guild, keywords: list, al
                     return resp.get("id")
             except Exception:
                 pass
-        async with aiohttp.ClientSession() as session:
-            url = f"https://discord.com/api/v10/guilds/{guild.id}/auto-moderation/rules"
-            headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-            async with session.post(url, json=payload, headers=headers) as r:
-                if r.status in (200, 201):
-                    data = await r.json()
-                    return data.get("id")
-                else:
-                    try:
-                        err_data = await r.json()
-                    except Exception:
-                        err_data = None
-                    try:
-                        txt = await r.text()
-                    except Exception:
-                        txt = str(err_data)
-                    print(f"AutoMod create failed: {r.status} {txt}")
-                    def _contains_disallowed(obj):
-                        if isinstance(obj, dict):
-                            for k, v in obj.items():
-                                if _contains_disallowed(v):
-                                    return True
-                            return False
-                        if isinstance(obj, list):
-                            for item in obj:
-                                if _contains_disallowed(item):
-                                    return True
-                            return False
-                        if isinstance(obj, str):
-                            return "AUTO_MODERATION_ACTION_TYPE_DISALLOWED" in obj
+
+        # Use shared aiohttp session
+        url = f"https://discord.com/api/v10/guilds/{guild.id}/auto-moderation/rules"
+        headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+        async with bot.aiohttp_session.post(url, json=payload, headers=headers) as r:
+            if r.status in (200, 201):
+                data = await r.json()
+                return data.get("id")
+            else:
+                # Try to parse JSON error body to detect disallowed action types
+                try:
+                    err_data = await r.json()
+                except Exception:
+                    err_data = None
+
+                # Log the original error body (string) for visibility
+                try:
+                    txt = await r.text()
+                except Exception:
+                    txt = str(err_data)
+                print(f"AutoMod create failed: {r.status} {txt}")
+
+                # Detect AUTO_MODERATION_ACTION_TYPE_DISALLOWED anywhere in the error payload
+                def _contains_disallowed(obj):
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            if _contains_disallowed(v):
+                                return True
                         return False
+                    if isinstance(obj, list):
+                        for item in obj:
+                            if _contains_disallowed(item):
+                                return True
+                        return False
+                    if isinstance(obj, str):
+                        return "AUTO_MODERATION_ACTION_TYPE_DISALLOWED" in obj
+                    return False
 
-                    if err_data and _contains_disallowed(err_data):
-                        print("AutoMod create failed due to disallowed action type; retrying without alert action...")
-                        payload_no_alert = {
-                            "name": payload.get("name"),
-                            "event_type": payload.get("event_type"),
-                            "trigger_type": payload.get("trigger_type"),
-                            "trigger_metadata": payload.get("trigger_metadata"),
-                            "actions": [{"type": 1}],
-                            "enabled": payload.get("enabled", True),
-                        }
-                        async with session.post(url, json=payload_no_alert, headers=headers) as r2:
-                            if r2.status in (200, 201):
-                                data2 = await r2.json()
-                                print("AutoMod created without alert action (fallback)")
-                                return data2.get("id")
-                            else:
-                                try:
-                                    t2 = await r2.text()
-                                except Exception:
-                                    t2 = None
-                                print(f"AutoMod create retry (no alert) failed: {r2.status} {t2}")
-                                return None
+                if err_data and _contains_disallowed(err_data):
+                    print("AutoMod create failed due to disallowed action type; retrying without alert action...")
+                    # Retry without the alert action (keep only BLOCK_MESSAGE)
+                    payload_no_alert = {
+                        "name": payload.get("name"),
+                        "event_type": payload.get("event_type"),
+                        "trigger_type": payload.get("trigger_type"),
+                        "trigger_metadata": payload.get("trigger_metadata"),
+                        "actions": [{"type": 1}],
+                        "enabled": payload.get("enabled", True),
+                    }
+                    async with bot.aiohttp_session.post(url, json=payload_no_alert, headers=headers) as r2:
+                        if r2.status in (200, 201):
+                            data2 = await r2.json()
+                            print("AutoMod created without alert action (fallback)")
+                            return data2.get("id")
+                        else:
+                            try:
+                                t2 = await r2.text()
+                            except Exception:
+                                t2 = None
+                            print(f"AutoMod create retry (no alert) failed: {r2.status} {t2}")
+                            return None
 
-                    return None
+                return None
     except Exception as e:
         print(f"Error creating automod rule: {e}")
         return None
@@ -532,16 +479,15 @@ async def _delete_automod_rule_via_rest(guild: discord.Guild, rule_id: str):
             except Exception:
                 pass
 
-        async with aiohttp.ClientSession() as session:
-            url = f"https://discord.com/api/v10/guilds/{guild.id}/auto-moderation/rules/{rule_id}"
-            headers = {"Authorization": f"Bot {token}"}
-            async with session.delete(url, headers=headers) as r:
-                if r.status in (200, 204):
-                    return True
-                else:
-                    txt = await r.text()
-                    print(f"AutoMod delete failed: {r.status} {txt}")
-                    return False
+        url = f"https://discord.com/api/v10/guilds/{guild.id}/auto-moderation/rules/{rule_id}"
+        headers = {"Authorization": f"Bot {token}"}
+        async with bot.aiohttp_session.delete(url, headers=headers) as r:
+            if r.status in (200, 204):
+                return True
+            else:
+                txt = await r.text()
+                print(f"AutoMod delete failed: {r.status} {txt}")
+                return False
     except Exception as e:
         print(f"Error deleting automod rule: {e}")
         return False
@@ -551,6 +497,7 @@ async def _update_automod_rule_keywords_via_rest(guild: discord.Guild, rule_id: 
     """Update an existing automod rule's keyword list. If keywords is empty, delete the rule.
     Returns True on success (including deletion), False otherwise."""
     try:
+        # If there are no keywords left, delete the automod rule entirely
         if not keywords:
             print("No keywords left; deleting automod rule instead of updating")
             return await _delete_automod_rule_via_rest(guild, rule_id)
@@ -562,10 +509,13 @@ async def _update_automod_rule_keywords_via_rest(guild: discord.Guild, rule_id: 
             "trigger_metadata": {"keyword_filter": keywords},
             "enabled": True,
         }
+
+        # Try to preserve the alert action if an alert_channel_id was provided; otherwise attempt block-only.
         actions_with_alert = [{"type": 1}]
         if alert_channel_id:
             actions_with_alert.append({"type": 4, "metadata": {"channel_id": str(alert_channel_id)}})
 
+        # Attempt PATCH using discord.py http if available
         if hasattr(bot, "http") and hasattr(bot.http, "request"):
             try:
                 data_payload = dict(payload_base)
@@ -577,21 +527,27 @@ async def _update_automod_rule_keywords_via_rest(guild: discord.Guild, rule_id: 
             except Exception:
                 pass
 
+        # Fallback to aiohttp
         async with aiohttp.ClientSession() as session:
             url = f"https://discord.com/api/v10/guilds/{guild.id}/auto-moderation/rules/{rule_id}"
             headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+
+            # First try with alert action if provided
             first_payload = dict(payload_base)
             first_payload["actions"] = actions_with_alert if alert_channel_id else [{"type": 1}]
 
             async with session.patch(url, json=first_payload, headers=headers) as r:
                 if r.status in (200, 201):
                     return True
+                # parse error body
                 try:
                     err = await r.json()
                 except Exception:
                     err = None
                 txt = await r.text()
                 print(f"AutoMod update failed: {r.status} {txt}")
+
+                # detect disallowed action type and retry without alert action
                 def _contains_disallowed(obj):
                     if isinstance(obj, dict):
                         for k, v in obj.items():
@@ -708,86 +664,14 @@ async def automod(interaction: discord.Interaction, action: str):
         else:
             await interaction.response.send_message("❌ Failed to delete AutoMod rule. Check logs.", ephemeral=True)
 
-@bot.command()
-@commands.has_permissions(send_messages=True)
-async def qoute(ctx):
-    url = "https://api.api-ninjas.com/v1/quotes"
-    headers = {"X-Api-Key": API_KEY} if API_KEY else {}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        quote_data = data[0]
-                        if quote_data and "quote" in quote_data and "author" in quote_data:
-                            quote = quote_data["quote"]
-                            author = quote_data["author"]
-                            if quote and author:
-                                embed = discord.Embed(
-                                    title="📜 Daily Quote",
-                                    description=f"“{quote}”",
-                                    color=discord.Color.blue()
-                                )
-                                embed.set_footer(text=f"— {str(author)}")
-                                await ctx.send(embed=embed)
-                                return
-                        await ctx.send("❌ Couldn't find a valid quote right now.")
-                    else:
-                        await ctx.send(f"❌ Invalid API response (status: {response.status}).")
-                else:
-                    await ctx.send(f"❌ Failed to fetch quote (status: {response.status}).")
-    except (aiohttp.ClientError, discord.Forbidden, discord.HTTPException) as e:
-        await ctx.send(f"❌ An error occurred: {e}")
-    except Exception as e:
-        await ctx.send(f"❌ An unexpected error occurred: {e}")
-        traceback.print_exc()
 
-
-
-@bot.tree.command(name="qoute", description="Says A random qoute")
-async def qoute(interaction: discord.Interaction):
-    url = "https://api.api-ninjas.com/v1/quotes"
-    headers = {"X-Api-Key": API_KEY} if API_KEY else {}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if not isinstance(data, list) or len(data) == 0:
-                        await interaction.response.send_message("❌ Couldn't find a valid quote right now.")
-                        return
-                    quote_data = data[0]
-                    if not isinstance(quote_data, dict):
-                        await interaction.response.send_message("❌ Malformed data received from API.")
-                        return
-                    quote = quote_data.get("quote")
-                    author = quote_data.get("author")
-                    if not quote or not author:
-                        await interaction.response.send_message("❌ Malformed data received from API.")
-                        return
-                    embed = discord.Embed(
-                        title="📜 Daily Quote",
-                        description=f"“{quote}”",
-                        color=discord.Color.blue()
-                    )
-                    embed.set_footer(text=f"— {str(author)}")
-                    await interaction.response.send_message(embed=embed)
-                else:
-                    await interaction.response.send_message(f"❌ Failed to fetch quote (status: {response.status}).")
-    except (aiohttp.ClientError, discord.Forbidden, discord.HTTPException) as e:
-        await interaction.response.send_message(f"❌ An error occurred: {e}")
-    except Exception as e:
-        await interaction.response.send_message(f"❌ An unexpected error occurred: {e}")
-        traceback.print_exc()
-
-@bot.command(name="automod", aliases=["am", "auto-mod"]) 
+@bot.command(name="automod", aliases=["am", "auto-mod"])
 @commands.has_permissions(manage_guild=True)
-async def automod_cmd(ctx, action: Optional[str] = None):
+async def automod_cmd(ctx, action: str = None):
     if not action:
         await ctx.send("❌ Please specify `enable` or `disable`")
         return
-    if action.lower() == "on":
+    if action.lower() in {"on", "enable"}:
         guild = ctx.guild
         guild_id = guild.id
         log_channel_id, _ = load_config(guild_id)
@@ -810,7 +694,7 @@ async def automod_cmd(ctx, action: Optional[str] = None):
         except Exception:
             pass
 
-    elif action.lower() == "off":
+    elif action.lower() in {"off", "disable"}:
         guild_id = ctx.guild.id
         existing = load_automod_rule_id(guild_id)
         if not existing:
@@ -828,27 +712,11 @@ async def automod_cmd(ctx, action: Optional[str] = None):
             await ctx.send("❌ Failed to delete AutoMod rule. Check logs.")
 
 
-async def initialize_apod_cache():
-    """Initialize the APOD cache at startup."""
-    print("🌌 Initializing APOD cache...")
-    try:
-        embed, file = await fetch_nasa_apod(use_cache=False)
-        print("✅ Successfully initialized APOD cache")
-        return embed
-    except Exception as e:
-        print(f"❌ Failed to initialize APOD cache: {e}")
-        return None
-
 @bot.event
 async def setup_hook():
-    tasks = [
-        asyncio.create_task(initialize_apod_cache(), name="init_apod"),
-        asyncio.create_task(keep_alive_task(), name="keep_alive"),
-    ]
-    bot.background_task = tasks[0] 
-    
-    print("Syncing application commands...")
-    await bot.tree.sync()
+    bot.aiohttp_session = aiohttp.ClientSession()
+    bot.background_task = asyncio.create_task(keep_alive_task())
+    bot.scheduled_invite_task = asyncio.create_task(process_scheduled_invites())
     try:
         if hasattr(bot.tree, "add_check"):
             bot.tree.add_check(global_slash_block_check)
@@ -862,36 +730,31 @@ async def setup_hook():
                     continue
     except Exception as e:
         print(f"[WARN] Could not register global slash check: {e}")
+    print("Syncing application commands...")
+    await bot.tree.sync()
 
-    try:
-        await asyncio.wait([tasks[0]], timeout=30)  
-    except Exception as e:
-        print(f"[WARN] Error waiting for cache initialization: {e}")
-    finally:
-        if not tasks[0].done():
-            tasks[0].cancel()
-            try:
-                await tasks[0]
-            except asyncio.CancelledError:
-                pass
+    # Create database indexes
+    scheduled_invites_collection.create_index([("status", 1), ("send_at", 1)])
+    warnings_collection.create_index([("guild_id", 1), ("user_id", 1), ("created_at", 1)])
 
 
 @bot.event
 async def on_ready():
     global bot_start_time
-    bot_start_time = discord.utils.utcnow()
-    
-    bot_start_time = discord.utils.utcnow()
+    if bot_start_time is None:
+        bot_start_time = discord.utils.utcnow()
 
     print(f"We are ready to go in, {bot.user.name}")
     try:
-        synced = await bot.tree.sync()
+        synced = bot.tree.get_commands()
         print(f"✅ Synced {len(synced)} global commands: {[cmd.name for cmd in synced]}")
+        # Print debug info on startup
+        debug_db()
     except Exception as e:
         print(f"❌ Failed to sync commands: {e}")
 
 
-# --- Guild blacklist collection and global blacklist 
+# --- Guild blacklist collection and global blacklist
 guild_blacklist_collection = db["guild_blacklists"]
 try:
     guild_blacklist_collection.create_index("guild_id", unique=True)
@@ -901,7 +764,9 @@ except Exception as e:
 
 # Global blacklist only editable in source code
 GLOBAL_BLACKLIST = [
-    1147879160782528593,
+  1400613835445899416, # Tray's main acc ##################### Pinkly #chloe's main acc
+  1420535411339563234, #Tray's alt  # Pinkly main
+
 ]
 
 BLACKLIST_BLOCK_MESSAGE = "You are banned from using this bot. If you think this is an mistake please contact either the server admins or the bot owner."
@@ -1045,402 +910,13 @@ async def global_slash_block_check(interaction: discord.Interaction):
     except Exception as e:
         print(f"[WARN] global_slash_block_check error: {e}")
         return True
-    
-@bot.tree.command(name="weather", description="Get weather information for a specific location")
-@app_commands.describe(location="The city or location to get weather for (e.g., 'New York City', 'Houston')")
-async def weather(interaction: discord.Interaction, location: str):
-    """Get current weather information for a specified location"""
-    await interaction.response.defer()
-
-    try:
-        # First, geocode the location to get coordinates
-        async with aiohttp.ClientSession() as session:
-            # Use Open-Meteo's geocoding API
-            geocode_url = "https://geocoding-api.open-meteo.com/v1/search"
-            geocode_params = {
-                "name": location,
-                "count": 1,
-                "language": "en",
-            }
-
-            async with session.get(geocode_url, params=geocode_params) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send("❌ Failed to find location. Try a different search.", ephemeral=True)
-                    return
-                geo_data = await resp.json()
-
-            if not geo_data.get("results"):
-                await interaction.followup.send(f"❌ Location '{location}' not found. Please try another location.", ephemeral=True)
-                return
-
-            result = geo_data["results"][0]
-            latitude = result.get("latitude")
-            longitude = result.get("longitude")
-            city_name = result.get("name", "Unknown")
-            country = result.get("country", "")
-            admin = result.get("admin1", "")
-
-            # Request current weather from Open-Meteo (use current_weather)
-            weather_url = "https://api.open-meteo.com/v1/forecast"
-            weather_params = {
-                "latitude": latitude,
-                "longitude": longitude,
-                # yarl/aiohttp requires query param values to be str/int/float (bool is disallowed)
-                "current_weather": "true",
-                # Request hourly relative humidity so we can display humidity even when current_weather
-                # does not include it (Open-Meteo often omits humidity from current_weather).
-                "hourly": "relativehumidity_2m,apparent_temperature",
-                "temperature_unit": "fahrenheit",
-                "timezone": "auto",
-            }
-
-            async with session.get(weather_url, params=weather_params) as resp2:
-                if resp2.status != 200:
-                    await interaction.followup.send("❌ Failed to fetch weather data.", ephemeral=True)
-                    return
-                weather_data = await resp2.json()
-
-        # Open-Meteo returns 'current_weather' with keys like temperature, windspeed, winddirection, weathercode
-        current = weather_data.get("current_weather", {}) or {}
-
-        # Map WMO weather codes to descriptions
-        weather_codes = {
-            0: ("☀️ Clear sky", 0xFDB813),
-            1: ("🌤️ Mainly clear", 0xFDB813),
-            2: ("⛅ Partly cloudy", 0xA3A3A3),
-            3: ("☁️ Overcast", 0x808080),
-            45: ("🌫️ Foggy", 0xB0C4DE),
-            48: ("🌫️ Depositing rime fog", 0xB0C4DE),
-            51: ("🌧️ Light drizzle", 0x4169E1),
-            53: ("🌧️ Moderate drizzle", 0x4169E1),
-            55: ("🌧️ Dense drizzle", 0x1E90FF),
-            61: ("🌧️ Slight rain", 0x4169E1),
-            63: ("🌧️ Moderate rain", 0x1E90FF),
-            65: ("⛈️ Heavy rain", 0x00008B),
-            71: ("❄️ Slight snow", 0xFFFFFF),
-            73: ("❄️ Moderate snow", 0xDCDCDC),
-            75: ("❄️ Heavy snow", 0xB0E0E6),
-            77: ("❄️ Snow grains", 0xDCDCDC),
-            80: ("🌧️ Slight rain showers", 0x4169E1),
-            81: ("🌧️ Moderate rain showers", 0x1E90FF),
-            82: ("⛈️ Violent rain showers", 0x00008B),
-            85: ("❄️ Slight snow showers", 0xDCDCDC),
-            86: ("❄️ Heavy snow showers", 0xB0E0E6),
-            95: ("⛈️ Thunderstorm", 0xFF6347),
-            96: ("⛈️ Thunderstorm with slight hail", 0xFF4500),
-            99: ("⛈️ Thunderstorm with heavy hail", 0xFF0000),
-        }
-
-        # Open-Meteo uses 'weathercode' in current_weather
-        weather_code = current.get("weathercode", 0)
-        weather_desc, color = weather_codes.get(weather_code, ("🌍 Unknown", 0x808080))
-
-        temp = current.get("temperature", "N/A")
-        feels_like = current.get("apparent_temperature", None)
-        try:
-            if feels_like is None:
-                # Attempt to read from hourly data if available
-                hourly = weather_data.get("hourly", {}) if isinstance(weather_data, dict) else {}
-                times = hourly.get("time", []) or []
-                feels_list = hourly.get("apparent_temperature") or []
-                cur_time = current.get("time")
-                if cur_time and times and feels_list:
-                    try:
-                        idx = times.index(cur_time)
-                        feels_like = feels_list[idx]
-                    except ValueError:
-                        # If exact match not found, try to find nearest by parsing ISO times
-                        try:
-                            from datetime import datetime
-                            times_dt = [datetime.fromisoformat(t) for t in times]
-                            cur_dt = datetime.fromisoformat(cur_time)
-                            nearest_idx = min(range(len(times_dt)), key=lambda i: abs((times_dt[i] - cur_dt).total_seconds()))
-                            feels_like = feels_list[nearest_idx]
-                        except Exception:
-                            feels_like = None
-                else:
-                    feels_like = None
-        except Exception:
-            feels_like = None
-
-        if feels_like is None:
-            feels_like = "N/A"
-
-        # Try to obtain humidity. Open-Meteo's `current_weather` doesn't always include
-        # humidity, so we request `hourly.relativehumidity_2m` and match by timestamp.
-        humidity = current.get("relativehumidity", current.get("relative_humidity", None))
-        try:
-            if humidity is None:
-                # Attempt to read from hourly data if available
-                hourly = weather_data.get("hourly", {}) if isinstance(weather_data, dict) else {}
-                times = hourly.get("time", []) or []
-                rh_list = hourly.get("relativehumidity_2m") or hourly.get("relative_humidity_2m") or []
-                cur_time = current.get("time")
-                if cur_time and times and rh_list:
-                    try:
-                        idx = times.index(cur_time)
-                        humidity = rh_list[idx]
-                    except ValueError:
-                        # If exact match not found, try to find nearest by parsing ISO times
-                        try:
-                            # find nearest index by absolute time difference
-                            from datetime import datetime
-
-                            times_dt = [datetime.fromisoformat(t) for t in times]
-                            cur_dt = datetime.fromisoformat(cur_time)
-                            nearest_idx = min(range(len(times_dt)), key=lambda i: abs((times_dt[i] - cur_dt).total_seconds()))
-                            humidity = rh_list[nearest_idx]
-                        except Exception:
-                            humidity = None
-                else:
-                    humidity = None
-        except Exception:
-            humidity = None
-
-        if humidity is None:
-            humidity = "N/A"
-
-        wind_speed = current.get("windspeed", current.get("wind_speed_10m", "N/A"))
-        wind_dir = current.get("winddirection", current.get("wind_direction_10m", "N/A"))
-
-        # Format location string
-        location_str = city_name
-        if admin:
-            location_str += f", {admin}"
-        if country:
-            location_str += f", {country}"
-
-        # Create embed
-        embed = discord.Embed(
-            title=f"{weather_desc}",
-            description=f"Weather for {location_str}",
-            color=color,
-            timestamp=discord.utils.utcnow(),
-        )
-
-        embed.add_field(
-            name="🌡️ Temperature",
-            value=_coerce_embed_value(f"**{temp}°F**\nFeels like: {feels_like}°F"),
-            inline=True,
-        )
-
-        embed.add_field(
-            name="💧 Humidity",
-            value=_coerce_embed_value(f"**{humidity}%**"),
-            inline=True,
-        )
-
-        embed.add_field(
-            name="💨 Wind",
-            value=_coerce_embed_value(f"**{wind_speed} mph**\nDirection: {wind_dir}°"),
-            inline=True,
-        )
-
-        embed.add_field(
-            name="📍 Coordinates",
-            value=_coerce_embed_value(f"Lat: {latitude}°\nLon: {longitude}°"),
-            inline=False,
-        )
-
-        embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
-
-        await interaction.followup.send(embed=embed)
-
-    except Exception as e:
-        print(f"[ERROR] Weather command error: {e}")
-        try:
-            await interaction.followup.send("❌ An error occurred while fetching weather data.", ephemeral=True)
-        except Exception:
-            pass
-
-
-async def fetch_weather_embed(location: str) -> discord.Embed:
-    """Helper: fetch weather and return a discord.Embed for the provided location."""
-    async with aiohttp.ClientSession() as session:
-        geocode_url = "https://geocoding-api.open-meteo.com/v1/search"
-        geocode_params = {"name": location, "count": 1, "language": "en", "format": "json"}
-        async with session.get(geocode_url, params=geocode_params) as resp:
-            if resp.status != 200:
-                raise RuntimeError("Failed to find location")
-            geo_data = await resp.json()
-
-        if not geo_data.get("results"):
-            raise RuntimeError(f"Location '{location}' not found")
-
-        result = geo_data["results"][0]
-        latitude = result.get("latitude")
-        longitude = result.get("longitude")
-        city_name = result.get("name", "Unknown")
-        country = result.get("country", "")
-        admin = result.get("admin1", "")
-
-        weather_url = "https://api.open-meteo.com/v1/forecast"
-        weather_params = {
-            "latitude": latitude,
-            "longitude": longitude,
-            # Use string 'true' to avoid TypeError from yarl when building query
-            "current_weather": "true",
-            # Ask for hourly relative humidity and apparent temperature so we can fall back to them when needed
-            "hourly": "relativehumidity_2m,apparent_temperature",
-            "temperature_unit": "fahrenheit",
-            "timezone": "auto",
-        }
-        async with session.get(weather_url, params=weather_params) as resp2:
-            if resp2.status != 200:
-                raise RuntimeError("Failed to fetch weather data")
-            weather_data = await resp2.json()
-
-    current = weather_data.get("current_weather", {}) or {}
-
-    weather_codes = {
-        0: ("☀️ Clear sky", 0xFDB813),
-        1: ("🌤️ Mainly clear", 0xFDB813),
-        2: ("⛅ Partly cloudy", 0xA3A3A3),
-        3: ("☁️ Overcast", 0x808080),
-        45: ("🌫️ Foggy", 0xB0C4DE),
-        48: ("🌫️ Depositing rime fog", 0xB0C4DE),
-        51: ("🌧️ Light drizzle", 0x4169E1),
-        53: ("🌧️ Moderate drizzle", 0x4169E1),
-        55: ("🌧️ Dense drizzle", 0x1E90FF),
-        61: ("🌧️ Slight rain", 0x4169E1),
-        63: ("🌧️ Moderate rain", 0x1E90FF),
-        65: ("⛈️ Heavy rain", 0x00008B),
-        71: ("❄️ Slight snow", 0xFFFFFF),
-        73: ("❄️ Moderate snow", 0xDCDCDC),
-        75: ("❄️ Heavy snow", 0xB0E0E6),
-        77: ("❄️ Snow grains", 0xDCDCDC),
-        80: ("🌧️ Slight rain showers", 0x4169E1),
-        81: ("🌧️ Moderate rain showers", 0x1E90FF),
-        82: ("⛈️ Violent rain showers", 0x00008B),
-        85: ("❄️ Slight snow showers", 0xDCDCDC),
-        86: ("❄️ Heavy snow showers", 0xB0E0E6),
-        95: ("⛈️ Thunderstorm", 0xFF6347),
-        96: ("⛈️ Thunderstorm with slight hail", 0xFF4500),
-        99: ("⛈️ Thunderstorm with heavy hail", 0xFF0000),
-    }
-
-    weather_code = current.get("weathercode", 0)
-    weather_desc, color = weather_codes.get(weather_code, ("🌍 Unknown", 0x808080))
-
-    temp = current.get("temperature", "N/A")
-    feels_like = current.get("apparent_temperature", None)
-    try:
-        if feels_like is None:
-            # Attempt to read from hourly data if available
-            hourly = weather_data.get("hourly", {}) if isinstance(weather_data, dict) else {}
-            times = hourly.get("time", []) or []
-            feels_list = hourly.get("apparent_temperature") or []
-            cur_time = current.get("time")
-            if cur_time and times and feels_list:
-                try:
-                    idx = times.index(cur_time)
-                    feels_like = feels_list[idx]
-                except ValueError:
-                    # If exact match not found, try to find nearest by parsing ISO times
-                    try:
-                        from datetime import datetime
-                        times_dt = [datetime.fromisoformat(t) for t in times]
-                        cur_dt = datetime.fromisoformat(cur_time)
-                        nearest_idx = min(range(len(times_dt)), key=lambda i: abs((times_dt[i] - cur_dt).total_seconds()))
-                        feels_like = feels_list[nearest_idx]
-                    except Exception:
-                        feels_like = None
-            else:
-                feels_like = None
-    except Exception:
-        feels_like = None
-
-    if feels_like is None:
-        feels_like = "N/A"
-
-    humidity = current.get("relativehumidity", current.get("relative_humidity", None))
-    try:
-        if humidity is None:
-            hourly = weather_data.get("hourly", {}) if isinstance(weather_data, dict) else {}
-            times = hourly.get("time", []) or []
-            rh_list = hourly.get("relativehumidity_2m") or hourly.get("relative_humidity_2m") or []
-            cur_time = current.get("time")
-            if cur_time and times and rh_list:
-                try:
-                    idx = times.index(cur_time)
-                    humidity = rh_list[idx]
-                except ValueError:
-                    try:
-                        from datetime import datetime
-
-                        times_dt = [datetime.fromisoformat(t) for t in times]
-                        cur_dt = datetime.fromisoformat(cur_time)
-                        nearest_idx = min(range(len(times_dt)), key=lambda i: abs((times_dt[i] - cur_dt).total_seconds()))
-                        humidity = rh_list[nearest_idx]
-                    except Exception:
-                        humidity = None
-            else:
-                humidity = None
-    except Exception:
-        humidity = None
-
-    if humidity is None:
-        humidity = "N/A"
-
-    wind_speed = current.get("windspeed", current.get("wind_speed_10m", "N/A"))
-    wind_dir = current.get("winddirection", current.get("wind_direction_10m", "N/A"))
-
-    location_str = city_name
-    if admin:
-        location_str += f", {admin}"
-    if country:
-        location_str += f", {country}"
-
-    embed = discord.Embed(
-        title=f"{weather_desc}",
-        description=f"Weather for {location_str}",
-        color=color,
-        timestamp=discord.utils.utcnow(),
-    )
-    embed.add_field(name="🌡️ Temperature", value=_coerce_embed_value(f"**{temp}°F**\nFeels like: {feels_like}°F"), inline=True)
-    embed.add_field(name="💧 Humidity", value=_coerce_embed_value(f"**{humidity}%**"), inline=True)
-    embed.add_field(name="💨 Wind", value=_coerce_embed_value(f"**{wind_speed} mph**\nDirection: {wind_dir}°"), inline=True)
-    embed.add_field(name="📍 Coordinates", value=_coerce_embed_value(f"Lat: {latitude}°\nLon: {longitude}°"), inline=False)
-    embed.set_footer(text=f"Requested by Bread Bot")
-
-    return embed
-
-
-@bot.command(name="weather")
-async def weather_cmd(ctx, *, location: Optional[str] = None):
-    """Prefix command: bread weather <location>
-    If no location is provided, prompt the user with an embed asking for a location."""
-    if not location or not location.strip():
-        embed = discord.Embed(
-            title="🔎 Need a location",
-            description="Please provide a location. Usage: `bread weather <city or location>`\nExample: `bread weather New York City`",
-            color=0x0099FF,
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.set_footer(text="You can also use the slash command: /weather")
-        await ctx.send(embed=embed)
-        return
-
-    try:
-        # Use the async typing context manager (Context.trigger_typing() isn't available on all discord.py versions)
-        async with ctx.typing():
-            embed = await fetch_weather_embed(location)
-            await ctx.send(embed=embed)
-    except RuntimeError as re:
-        await ctx.send(f"❌ {str(re)}")
-    except Exception as e:
-        # Log full traceback to the process output for debugging
-        print("[ERROR] Exception in prefix weather command:")
-        traceback.print_exc()
-        # Send a generic message to Discord to avoid leaking internal exception details
-        await ctx.send("❌ An internal error occurred while fetching weather. The error has been logged.")
 
 
 @bot.tree.command(name="blacklist", description="Manage the server blacklist (admins only)")
 @app_commands.describe(action="add/remove/list", user="User to add/remove")
 @app_commands.choices(action=[app_commands.Choice(name="add", value="add"), app_commands.Choice(name="remove", value="remove"), app_commands.Choice(name="list", value="list")])
 @commands.has_permissions(administrator=True)
-async def blacklist(interaction: discord.Interaction, action: str, user: Optional[discord.Member] = None):
+async def blacklist(interaction: discord.Interaction, action: str, user: discord.Member = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permissions required", ephemeral=True)
         return
@@ -1525,7 +1001,7 @@ async def blacklist(interaction: discord.Interaction, action: str, user: Optiona
 
 @bot.command(name="blacklist", help="Manage server blacklist (admin only)")
 @commands.has_permissions(administrator=True)
-async def blacklist_cmd(ctx, action: str, user: Optional[discord.Member] = None):
+async def blacklist_cmd(ctx, action: str, user: discord.Member = None):
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("❌ Administrator permissions required")
         return
@@ -1645,6 +1121,8 @@ async def coin_toss(interaction: discord.Interaction):
 @commands.has_permissions(kick_members=True)
 async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
     """Kick a member from the server (prefix command)"""
+    await ctx.send("Use `/kick` so the required reason and evidence form is recorded.")
+    return
     if not ctx.guild.me.guild_permissions.kick_members:
         await ctx.send("❌ I don't have permission to kick members!")
         return
@@ -1672,7 +1150,7 @@ async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
                 f"You have been kicked from **{ctx.guild.name}**\nReason: {reason}"
             )
         except:
-            pass  
+            pass
 
         await member.kick(reason=f"{reason} (kicked by {ctx.author})")
 
@@ -1713,8 +1191,6 @@ async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
         )
 
 
-@bot.tree.command(name="kick", description="Kick a member from the server")
-@app_commands.describe(member="The member to kick", reason="Reason for kicking")
 async def kick_slash(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -1800,8 +1276,6 @@ async def kick_slash(
         )
 
 
-@bot.tree.command(name="ban", description="Ban a member from the server")
-@app_commands.describe(member="The member to ban", reason="Reason for banning")
 async def ban(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -1874,7 +1348,7 @@ async def ban(
 async def unban(
     interaction: discord.Interaction,
     user: discord.User,
-    reason: str = "No reason provided",
+    reason: str,
 ):
     if not interaction.user.guild_permissions.ban_members:
         await interaction.response.send_message(
@@ -1917,12 +1391,36 @@ async def unban(
         )
 
 
-@bot.tree.command(name="mute", description="Mute a member for a specified duration")
-@app_commands.describe(
-    member="The member to mute",
-    duration="Duration in minutes",
-    reason="Reason for muting",
-)
+@bot.tree.command(name="unkick", description="Send a kicked user a new server invite")
+@app_commands.describe(user="Kicked user to invite back", reason="Reason for inviting them back")
+async def unkick(interaction: discord.Interaction, user: discord.User, reason: str):
+    """A kick cannot be reversed; this sends the user a new one-use invite."""
+    if not interaction.user.guild_permissions.kick_members:
+        await interaction.response.send_message("❌ Kick Members permission is required.", ephemeral=True)
+        return
+    if interaction.guild.get_member(user.id):
+        await interaction.response.send_message("❌ That user is already in the server.", ephemeral=True)
+        return
+    channel = next(
+        (channel for channel in interaction.guild.text_channels
+         if channel.permissions_for(interaction.guild.me).create_instant_invite),
+        None,
+    )
+    if not channel:
+        await interaction.response.send_message("❌ I need Create Invite permission in at least one text channel.", ephemeral=True)
+        return
+    try:
+        invite = await channel.create_invite(max_age=604800, max_uses=1, reason=f"Unkick by {interaction.user}: {reason}")
+        await user.send(f"You have been invited back to **{interaction.guild.name}**.\nReason: {reason}\n{invite.url}")
+        await send_mod_log(interaction.guild, "Rejoin invite sent", f"A moderator sent {user.mention} a new invite.", 0x2ECC71,
+            [("Moderator", interaction.user.mention, True), ("Reason", reason, False)])
+        await interaction.response.send_message(f"✅ A rejoin invite was sent to {user.mention}.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ I could not create the invite or DM that user.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.response.send_message("❌ Discord could not send that rejoin invite.", ephemeral=True)
+
+
 async def mute(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -2006,6 +1504,8 @@ async def mute(
     ctx, member: discord.Member, duration: int = 10, *, reason="No reason provided"
 ):
     """Mute a member for a specified duration (in minutes)"""
+    await ctx.send("Use `/mute` so the required reason and evidence form is recorded.")
+    return
     if not ctx.guild.me.guild_permissions.moderate_members:
         await ctx.send("❌ I don't have permission to timeout members!")
         return
@@ -2121,6 +1621,62 @@ async def purge(interaction: discord.Interaction, limit: int = 2000):
         )
 
 
+@bot.tree.command(name="broadcast", description="Broadcast a message to all channels")
+@app_commands.describe(
+    message="The message to broadcast", ping_everyone="Whether to ping @everyone"
+)
+async def broadcast(
+    interaction: discord.Interaction, message: str, ping_everyone: bool = False
+):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "No one wants to hear you talking", ephemeral=False
+        )
+        return
+
+    if not interaction.guild.me.guild_permissions.send_messages:
+        await interaction.response.send_message(
+            "❌ I don't have permission to send messages!", ephemeral=True
+        )
+        return
+
+    try:
+        channel_count = 0
+        broadcast_message = f"@everyone {message}" if ping_everyone else message
+
+        for channel in interaction.guild.text_channels:
+            try:
+                await channel.send(broadcast_message)
+                channel_count += 1
+            except discord.Forbidden:
+                continue
+
+        ping_status = "with @everyone ping" if ping_everyone else "without ping"
+        await interaction.response.send_message(
+            f"✅ Broadcasted message to {channel_count} channels {ping_status}!",
+            ephemeral=True,
+        )
+        try:
+            await send_mod_log(
+                guild=interaction.guild,
+                title="📣 Broadcast Sent",
+                description=f"Broadcast sent by {interaction.user.mention} to {channel_count} channels ({ping_status}).",
+                color=0xF1C40F,
+                fields=[
+                    ("Moderator", interaction.user.mention, True),
+                    ("Channels Sent", str(channel_count), True),
+                    ("Ping Status", ping_status, True),
+                    ("Message", (message[:1024] + '...') if len(message) > 1024 else message, False),
+                ],
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ An error occurred: {e}", ephemeral=True
+        )
+
+
 @bot.tree.command(
     name="setwelcome", description="Set the welcome channel for new members"
 )
@@ -2157,13 +1713,13 @@ async def set_welcome_channel(
 
 
 async def send_mod_log(
-    guild: Optional[discord.Guild],
+    guild: discord.Guild,
     title: str,
     description: str,
     color: int,
-    fields: Optional[List[Tuple[str, str, bool]]] = None,
-    thumbnail: Optional[str] = None,
-) -> bool:
+    fields: list = None,
+    thumbnail: str = None,
+):
     """Helper function to send mod logs to the log channel"""
     global LOG_CHANNEL_ID
 
@@ -2208,36 +1764,555 @@ async def send_mod_log(
 
         if fields:
             for name, value, inline in fields:
-                safe_value = _coerce_embed_value(value)
-                embed.add_field(name=name, value=safe_value, inline=inline)
+                embed.add_field(name=name, value=value, inline=inline)
 
         if thumbnail:
             embed.set_thumbnail(url=thumbnail)
 
-        try:
-            safe_embed = sanitize_embed(embed)
-        except Exception:
-            safe_embed = embed
-
-        # Ensure we have a channel-like object that supports send
-        if log_channel is None:
-            print("[WARN] No log channel resolved for send_mod_log")
-            return False
-        try:
-            # runtime: many channel types have send; narrow with hasattr to satisfy type-checkers
-            if hasattr(log_channel, "send"):
-                await cast(Any, log_channel).send(embed=safe_embed)
-                return True
-            else:
-                print("[WARN] log_channel does not support send()")
-                return False
-        except Exception as e:
-            print(f"[ERROR] send_mod_log send failed: {e}")
-            return False
+        await log_channel.send(embed=embed)
         return True
     except Exception as e:
         print(f"Failed to send mod log: {e}")
         return False
+
+
+# ===== Modal moderation workflow =====
+def _moderation_target_allowed(guild, moderator, member):
+    """Return a short error when a moderator cannot act on a member."""
+    if member == moderator:
+        return "You cannot moderate yourself."
+    if member == guild.owner:
+        return "You cannot moderate the server owner."
+    if member == guild.me or member.top_role >= guild.me.top_role:
+        return "I cannot moderate that member because of role hierarchy."
+    if moderator != guild.owner and member.top_role >= moderator.top_role:
+        return "You cannot moderate a member with an equal or higher role."
+    return None
+
+
+async def _send_temporary_confirmation(interaction, content):
+    await interaction.response.send_message(content)
+    message = await interaction.original_response()
+    await asyncio.sleep(60)
+    try:
+        await message.delete()
+    except (discord.NotFound, discord.Forbidden):
+        pass
+
+
+async def _dm_punishment(member, guild, action, reason, evidence, duration):
+    embed = discord.Embed(title=f"Moderation notice: {action.title()}", color=0xE74C3C)
+    embed.add_field(name="Server", value=guild.name, inline=False)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="Duration", value=duration, inline=True)
+    embed.add_field(name="Evidence", value=evidence, inline=False)
+    try:
+        await member.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
+def _find_member(guild, value):
+    """Resolve a modal's username, mention, or numeric ID to a guild member."""
+    value = value.strip()
+    if value.startswith("<@") and value.endswith(">"):
+        value = value.strip("<@!>")
+    if value.isdigit():
+        return guild.get_member(int(value))
+    lowered = value.casefold()
+    return discord.utils.find(
+        lambda member: member.name.casefold() == lowered
+        or member.display_name.casefold() == lowered
+        or str(member).casefold() == lowered,
+        guild.members,
+    )
+
+
+async def _queue_rejoin_invite(guild, user_id, days, reason):
+    scheduled_invites_collection.update_one(
+        {"guild_id": guild.id, "user_id": user_id, "status": "pending"},
+        {"$set": {
+            "guild_id": guild.id, "user_id": user_id, "reason": reason,
+            "send_at": discord.utils.utcnow() + datetime.timedelta(days=days),
+            "status": "pending", "created_at": discord.utils.utcnow(),
+        }}, upsert=True,
+    )
+
+
+async def _perform_moderation(interaction, member, action, reason, evidence, duration=None, rejoin_days=None):
+    guild = interaction.guild
+    moderator = interaction.user
+    error = _moderation_target_allowed(guild, moderator, member)
+    if error:
+        await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+        return
+
+    permission = {"ban": "ban_members", "kick": "kick_members", "timeout": "moderate_members"}[action]
+    if not getattr(moderator.guild_permissions, permission) or not getattr(guild.me.guild_permissions, permission):
+        await interaction.response.send_message("❌ You or I do not have the required moderation permission.", ephemeral=True)
+        return
+
+    duration_label = "Permanent" if action == "ban" else (f"{duration} minutes" if action == "timeout" else f"Invite sent in {rejoin_days} days")
+    dm_sent = False
+    try:
+        if action in {"ban", "kick"}:
+            dm_sent = await _dm_punishment(member, guild, action, reason, evidence, duration_label)
+        if action == "ban":
+            await member.ban(reason=f"{reason} | Evidence: {evidence} | Moderator: {moderator}")
+        elif action == "kick":
+            await member.kick(reason=f"{reason} | Evidence: {evidence} | Moderator: {moderator}")
+            await _queue_rejoin_invite(guild, member.id, rejoin_days, reason)
+        else:
+            until = discord.utils.utcnow() + datetime.timedelta(minutes=duration)
+            await member.timeout(until, reason=f"{reason} | Evidence: {evidence} | Moderator: {moderator}")
+        moderation_cases_collection.insert_one({
+            "guild_id": guild.id, "user_id": member.id, "moderator_id": moderator.id,
+            "action": action, "reason": reason, "evidence": evidence,
+            "duration": duration_label, "created_at": discord.utils.utcnow(),
+        })
+        past_tense = {"ban": "banned", "kick": "kicked", "timeout": "timed out"}[action]
+        await send_mod_log(guild, f"{action.title()} issued", f"{member.mention} was {past_tense}.", 0xE74C3C,
+            [("Moderator", moderator.mention, True), ("Reason", reason, False),
+             ("Evidence", evidence, False), ("Duration", duration_label, True),
+             ("DM delivered", "Yes" if dm_sent else "No / not required", True)],
+            member.display_avatar.url)
+        await _send_temporary_confirmation(interaction, f"✅ {member.mention} has been {past_tense}. This confirmation disappears in 60 seconds.")
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Discord denied that moderation action. Check my role and permissions.", ephemeral=True)
+    except Exception as exc:
+        print(f"[ERROR] moderation action failed: {exc}")
+        await interaction.response.send_message("❌ The moderation action could not be completed.", ephemeral=True)
+
+
+class ModerationModal(discord.ui.Modal):
+    def __init__(self, action):
+        super().__init__(title=f"{action.title()} member")
+        self.action = action
+        self.target = discord.ui.TextInput(label="Discord username or user ID", placeholder="Example: @name, username, or 123456789", max_length=100)
+        self.reason = discord.ui.TextInput(label="Why / reason", placeholder="Required", style=discord.TextStyle.paragraph, max_length=500)
+        self.evidence = discord.ui.TextInput(label="Evidence (optional)", placeholder="Message link, image link, or summary", required=False, style=discord.TextStyle.paragraph, max_length=1000)
+        self.add_item(self.target)
+        self.add_item(self.reason)
+        self.add_item(self.evidence)
+        if action == "timeout":
+            self.duration = discord.ui.TextInput(label="Timeout length (minutes)", placeholder="1 to 40320", max_length=5)
+            self.add_item(self.duration)
+        elif action == "kick":
+            self.rejoin_days = discord.ui.TextInput(label="Send new invite after (days)", placeholder="5 to 30", max_length=2)
+            self.add_item(self.rejoin_days)
+
+    async def on_submit(self, interaction):
+        reason, evidence = self.reason.value.strip(), self.evidence.value.strip()
+        member = _find_member(interaction.guild, self.target.value)
+        if not member:
+            await interaction.response.send_message("❌ I could not find that member. Use their exact username, mention, or user ID.", ephemeral=True)
+            return
+        if not reason:
+            await interaction.response.send_message("❌ A reason is required.", ephemeral=True)
+            return
+        evidence = evidence or "Not provided"
+        duration = rejoin_days = None
+        try:
+            if self.action == "timeout":
+                duration = int(self.duration.value)
+                if not 1 <= duration <= 40320:
+                    raise ValueError
+            elif self.action == "kick":
+                rejoin_days = int(self.rejoin_days.value)
+                if not 5 <= rejoin_days <= 30:
+                    raise ValueError
+        except ValueError:
+            label = "Timeout length must be 1–40320 minutes." if self.action == "timeout" else "Rejoin delay must be 5–30 days."
+            await interaction.response.send_message(f"❌ {label}", ephemeral=True)
+            return
+        await _perform_moderation(interaction, member, self.action, reason, evidence, duration, rejoin_days)
+
+
+@bot.tree.command(name="ban", description="Ban a member using a reason and evidence form")
+async def modal_ban(interaction: discord.Interaction):
+    await interaction.response.send_modal(ModerationModal("ban"))
+
+
+@bot.tree.command(name="kick", description="Kick a member using a reason and evidence form")
+async def modal_kick(interaction: discord.Interaction):
+    await interaction.response.send_modal(ModerationModal("kick"))
+
+
+@bot.tree.command(name="mute", description="Mute a member using a reason and evidence form")
+async def modal_mute(interaction: discord.Interaction):
+    await interaction.response.send_modal(ModerationModal("timeout"))
+
+
+class WarningReviewView(discord.ui.View):
+    def __init__(self, guild_id, user_id):
+        super().__init__(timeout=300)  # 5 minutes timeout
+        self.guild_id, self.user_id = guild_id, user_id
+
+    async def _allowed(self, interaction):
+        if not interaction.user.guild_permissions.kick_members:
+            await interaction.response.send_message("❌ Moderator permission required.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.secondary)
+    async def ignore(self, interaction, button):
+        if not await self._allowed(interaction): return
+        await interaction.response.send_message("Report marked as ignored.", ephemeral=True)
+
+    @discord.ui.button(label="View mod", style=discord.ButtonStyle.primary)
+    async def view_history(self, interaction, button):
+        if not await self._allowed(interaction): return
+        warnings = list(warnings_collection.find({"guild_id": self.guild_id, "user_id": self.user_id}).sort("created_at", -1).limit(10))
+        history = "\n".join(f"• {item['reason']} — <@{item['moderator_id']}>" for item in warnings) or "No warning history found."
+        await interaction.response.send_message(history[:1900], ephemeral=True)
+
+    @discord.ui.button(label="Take action", style=discord.ButtonStyle.danger)
+    async def take_action(self, interaction, button):
+        if not await self._allowed(interaction): return
+        member = interaction.guild.get_member(self.user_id)
+        if not member:
+            await interaction.response.send_message("❌ The member is no longer in the server.", ephemeral=True)
+            return
+        error = _moderation_target_allowed(interaction.guild, interaction.user, member)
+        if error:
+            await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+            return
+        warnings = get_member_warnings(self.guild_id, self.user_id)
+        if len(warnings) >= 3:
+            await member.kick(reason=f"Third-warning escalation by {interaction.user}")
+            await send_mod_log(interaction.guild, "Third-warning kick", f"{member.mention} was kicked after moderator review.", 0xE74C3C,
+                [("Moderator", interaction.user.mention, True), ("Reason", "Third-warning escalation", False)])
+            await interaction.response.send_message(f"✅ {member.mention} has been kicked.", ephemeral=True)
+        elif len(warnings) >= 4:
+            await member.ban(reason=f"Fourth-warning escalation by {interaction.user}")
+            await send_mod_log(interaction.guild, "Fourth-warning ban", f"{member.mention} was banned after moderator review.", 0xE74C3C,
+                [("Moderator", interaction.user.mention, True), ("Reason", "Fourth-warning escalation", False)])
+            await interaction.response.send_message(f"✅ {member.mention} has been banned.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ The member does not have enough warnings to take action.", ephemeral=True)
+
+
+def build_warning_embed(member, warning, number):
+    """Create the compact yellow moderation card used for warning logs/history."""
+    created_at = warning.get("created_at") or discord.utils.utcnow()
+    embed = discord.Embed(
+        title=f"Warning Issued {number}",
+        description=(
+            f"> **User:** {member.mention} (`{member.id}`)\n"
+            f"> **Reason:** {warning.get('reason', 'No reason recorded')}\n"
+            f"> **Duration:** Permanent\n"
+            f"> **Warning:** #{number}"
+        ),
+        color=0xF1C40F,
+        timestamp=created_at,
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"Issued by <@{warning.get('moderator_id', 'unknown')}> • Warning #{number}")
+    return embed
+
+
+async def send_warning_log(guild, member, warning, number):
+    """Send a warning as a card rather than the generic moderation-log embed."""
+    embed = discord.Embed(title="Warning Issued", color=0xE74C3C)
+    embed.add_field(name="Member", value=member.mention, inline=True)
+    embed.add_field(name="Moderator", value=f"<@{warning['moderator_id']}", inline=True)
+    embed.add_field(name="Reason", value=warning['reason'], inline=False)
+    embed.add_field(name="Warning Number", value=number, inline=True)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"Issued by <@{warning['moderator_id']}> • Warning #{number}")
+    await send_mod_log(guild, "Warning Issued", embed=embed)
+    try:
+        log_channel_id, _ = load_config(guild.id)
+        channel = guild.get_channel(int(log_channel_id)) if log_channel_id else None
+        if channel:
+            await channel.send(embed=build_warning_embed(member, warning, number))
+            return True
+    except Exception as exc:
+        print(f"[ERROR] warning log: {exc}")
+    return False
+
+
+def get_member_warnings(guild_id, user_id):
+    warnings = list(
+        warnings_collection.find({"guild_id": guild_id, "user_id": user_id}).sort("created_at", 1)
+    )
+    for i, warning in enumerate(warnings):
+        warning['warning_number'] = i + 1
+    return warnings
+
+
+class WarningListView(discord.ui.View):
+    PAGE_SIZE = 3
+    ERROR_COLOR = 0xE74C3C  # Red
+    SUCCESS_COLOR = 0x2ECC71  # Green
+
+    def __init__(self, member, page=0):
+        super().__init__(timeout=300)
+        self.member = member
+        self.page = page
+        self.logger = logging.getLogger(__name__)
+        self._build_buttons()
+
+    def _page_warnings(self):
+        try:
+            warnings = get_member_warnings(self.member.guild.id, self.member.id)
+            pages = max(1, (len(warnings) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+            self.page = min(self.page, pages - 1)
+            start = self.page * self.PAGE_SIZE
+            return warnings, warnings[start:start + self.PAGE_SIZE], pages, start
+        except Exception as e:
+            self.logger.error(f"Error fetching warnings: {e!s}")
+            raise
+
+    def _build_buttons(self):
+        try:
+            warnings, visible, pages, start = self._page_warnings()
+            if pages > 1:
+                previous = discord.ui.Button(label="Previous", style=discord.ButtonStyle.secondary, disabled=self.page == 0)
+                next_page = discord.ui.Button(label="Next", style=discord.ButtonStyle.secondary, disabled=self.page >= pages - 1)
+
+                async def previous_callback(interaction):
+                    try:
+                        await self._change_page(interaction, self.page - 1)
+                    except Exception as e:
+                        self.logger.error(f"Error changing to previous page: {e!s}")
+                        await interaction.response.send_message(f"❌ Error: {e!s}", ephemeral=True)
+
+                async def next_callback(interaction):
+                    try:
+                        await self._change_page(interaction, self.page + 1)
+                    except Exception as e:
+                        self.logger.error(f"Error changing to next page: {e!s}")
+                        await interaction.response.send_message(f"❌ Error: {e!s}", ephemeral=True)
+
+                previous.callback = previous_callback
+                next_page.callback = next_callback
+                self.add_item(previous)
+                self.add_item(next_page)
+
+            for offset, warning in enumerate(visible):
+                number = start + offset + 1
+                button = discord.ui.Button(label=f"Delete #{number}", style=discord.ButtonStyle.danger)
+
+                async def delete_callback(interaction, warning_id=warning["_id"], warning_number=number):
+                    try:
+                        await self._delete_warning(interaction, warning_id, warning_number)
+                    except Exception as e:
+                        self.logger.error(f"Error deleting warning: {e!s}")
+                        await interaction.response.send_message(f"❌ Error: {e!s}", ephemeral=True)
+
+                button.callback = delete_callback
+                self.add_item(button)
+        except Exception as e:
+            self.logger.error(f"Error building buttons: {e!s}")
+            raise
+
+    async def _allowed(self, interaction):
+        try:
+            if not interaction.user.guild_permissions.kick_members:
+                await interaction.response.send_message("❌ Moderator permission is required to delete warnings.", ephemeral=True)
+                return False
+            return True
+        except Exception as e:
+            self.logger.error(f"Error checking permissions: {e!s}")
+            await interaction.response.send_message(f"❌ Error checking permissions: {e!s}", ephemeral=True)
+            return False
+
+    async def _change_page(self, interaction, new_page):
+        try:
+            if not await self._allowed(interaction): return
+            self.page = new_page
+            self.clear_items()
+            self._build_buttons()
+            await interaction.response.edit_message(embed=warning_list_embeds(self.member, self.page), view=self)
+        except Exception as e:
+            self.logger.error(f"Error changing page: {e!s}")
+            await interaction.response.send_message(f"❌ Error changing page: {e!s}", ephemeral=True)
+
+    async def _delete_warning(self, interaction, warning_id, warning_number):
+        try:
+            if not await self._allowed(interaction): return
+            result = warnings_collection.delete_one({"_id": warning_id, "guild_id": self.member.guild.id, "user_id": self.member.id})
+            if not result.deleted_count:
+                await interaction.response.send_message("❌ That warning was already removed.", ephemeral=True)
+                return
+            await send_mod_log(
+                interaction.guild, "Warning deleted", f"Warning #{warning_number} was removed for {self.member.mention}.", self.SUCCESS_COLOR,
+                [("Moderator", interaction.user.mention, True)], self.member.display_avatar.url,
+            )
+            view = WarningListView(self.member, self.page)
+            await interaction.response.edit_message(embeds=warning_list_embeds(self.member, view), view=view)
+            await interaction.followup.send(f"✅ Warning #{warning_number} has been successfully deleted.", ephemeral=True)
+        except Exception as e:
+            self.logger.error(f"Error deleting warning: {e!s}")
+            await interaction.response.send_message(f"❌ Error deleting warning: {e!s}", ephemeral=True)
+
+
+
+def warning_list_embeds(member, view):
+    warnings, visible, pages, start = view._page_warnings()
+    if not visible:
+        return [discord.Embed(title=f"Warnings for {member.display_name}", description="No active warnings.", color=0x2ECC71)]
+    embeds = [build_warning_embed(member, warning, start + offset + 1) for offset, warning in enumerate(visible)]
+    embeds[0].set_author(name=f"Warnings for {member} • {len(warnings)} total • Page {view.page + 1}/{pages}")
+    return embeds
+
+
+class WarningModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Warn member")
+        self.target = discord.ui.TextInput(label="Discord username or user ID", placeholder="Example: @name, username, or 123456789", max_length=100)
+        self.reason = discord.ui.TextInput(label="Reason", placeholder="Required", style=discord.TextStyle.paragraph, max_length=500)
+        self.add_item(self.target)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction):
+        try:
+            reason = self.reason.value.strip()
+            if not reason:
+                await interaction.response.send_message("❌ A warning reason is required.", ephemeral=True)
+                return
+
+            member = _find_member(interaction.guild, self.target.value)
+            if not member:
+                await interaction.response.send_message("❌ I could not find that member. Please try again with their exact username, mention, or user ID.", ephemeral=True)
+                return
+
+            # Check if the user is trying to warn themselves
+            if member.id == interaction.user.id:
+                await interaction.response.send_message("❌ You cannot warn yourself.", ephemeral=True)
+                return
+
+            # Check if the user is trying to warn a moderator
+            if member.guild_permissions.kick_members:
+                await interaction.response.send_message("❌ You cannot warn another moderator.", ephemeral=True)
+                return
+
+            # Check if the user is trying to warn the bot
+            if member.bot:
+                await interaction.response.send_message("❌ You cannot warn a bot.", ephemeral=True)
+                return
+
+            # Create the warning in the database
+            warning = {
+                "guild_id": interaction.guild.id,
+                "user_id": member.id,
+                "moderator_id": interaction.user.id,
+                "reason": reason,
+                "created_at": datetime.utcnow()
+            }
+            warnings_collection.insert_one(warning)
+
+            # Get the warning number
+            warnings = get_member_warnings(interaction.guild.id, member.id)
+            warning_number = len(warnings)
+
+            # Send the warning log
+            await send_warning_log(interaction.guild, member, warning, warning_number)
+
+            # Send confirmation message
+            await interaction.response.send_message(f"✅ {member.mention} has been warned for: {reason}", ephemeral=True)
+
+            # Check if the user has reached the warning threshold
+            if warning_number >= 3:
+                await member.kick(reason=f"Third-warning escalation by {interaction.user}")
+                await send_mod_log(
+                    interaction.guild, "Third-warning kick", f"{member.mention} was kicked after receiving 3 warnings.", 0xE74C3C,
+                    [("Moderator", interaction.user.mention, True), ("Reason", "Third-warning escalation", False)]
+                )
+                await interaction.followup.send(f"✅ {member.mention} has been kicked for reaching 3 warnings.", ephemeral=True)
+            elif warning_number >= 4:
+                await member.ban(reason=f"Fourth-warning escalation by {interaction.user}")
+                await send_mod_log(
+                    interaction.guild, "Fourth-warning ban", f"{member.mention} was banned after receiving 4 warnings.", 0xE74C3C,
+                    [("Moderator", interaction.user.mention, True), ("Reason", "Fourth-warning escalation", False)]
+                )
+                await interaction.followup.send(f"✅ {member.mention} has been banned for reaching 4 warnings.", ephemeral=True)
+
+        except Exception as e:
+            self.logger.error(f"Error in WarningModal: {e!s}")
+            await interaction.response.send_message(f"❌ An error occurred while processing your warning: {e!s}", ephemeral=True)
+        error = _moderation_target_allowed(interaction.guild, interaction.user, member)
+        if error:
+            await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+            return
+        if not interaction.guild.me.guild_permissions.kick_members:
+            await interaction.response.send_message("❌ I need Kick Members permission to manage warning escalations.", ephemeral=True)
+            return
+        warning = {"guild_id": interaction.guild.id, "user_id": member.id, "moderator_id": interaction.user.id, "reason": reason, "created_at": discord.utils.utcnow()}
+        warnings_collection.insert_one(warning)
+        count = warnings_collection.count_documents({"guild_id": interaction.guild.id, "user_id": member.id})
+        await send_warning_log(interaction.guild, member, warning, count)
+        if count == 3:
+            await member.kick(reason=f"Automatic kick after 3 warnings: {reason}")
+            await _queue_rejoin_invite(interaction.guild, member.id, 5, "Automatic rejoin after three warnings")
+            await send_mod_log(interaction.guild, "Automatic warning kick", f"{member.mention} was kicked after three warnings.", 0xE67E22,
+                [("Invite delay", "5 days", True)])
+        elif count == 4:
+            log_channel_id, _ = load_config(interaction.guild.id)
+            channel = interaction.guild.get_channel(int(log_channel_id)) if log_channel_id else None
+            if channel:
+                report = discord.Embed(title="Fourth warning reported", description=f"{member.mention} needs moderator review.", color=0xE74C3C)
+                report.add_field(name="Latest reason", value=reason, inline=False)
+                await channel.send(embed=report, view=WarningReviewView(interaction.guild.id, member.id))
+        await _send_temporary_confirmation(interaction, f"✅ Warning recorded for {member.mention} ({count}/4). This confirmation disappears in 60 seconds.")
+
+
+@bot.tree.command(name="warn", description="Warn a member using a required reason form")
+async def modal_warn(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.kick_members:
+        await interaction.response.send_message("❌ Kick Members permission is required to warn members.", ephemeral=True)
+        return
+    await interaction.response.send_modal(WarningModal())
+
+
+@bot.tree.command(name="warnings", description="View and manage a member's warnings")
+@app_commands.describe(member="Member whose warnings to view")
+async def slash_warnings(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.user.guild_permissions.kick_members:
+        await interaction.response.send_message("❌ Kick Members permission is required to view warnings.", ephemeral=True)
+        return
+    view = WarningListView(member)
+    await interaction.response.send_message(embeds=warning_list_embeds(member, view), view=view, ephemeral=True)
+
+
+@bot.command(name="warnings", aliases=["warns"])
+@commands.has_permissions(kick_members=True)
+async def prefix_warnings(ctx, member: discord.Member = None):
+    """View and manage a member's warning history."""
+    if not member:
+        await ctx.send("Usage: `bread warnings @member`")
+        return
+    view = WarningListView(member)
+    await ctx.send(embeds=warning_list_embeds(member, view), view=view)
+
+
+async def process_scheduled_invites():
+    await bot.wait_until_ready()
+    change_stream = scheduled_invites_collection.watch([
+        {"$match": {
+            "operationType": "insert",
+            "fullDocument.status": "pending",
+            "fullDocument.send_at": {"$lte": discord.utils.utcnow()}
+        }}
+    ])
+
+    async for change in change_stream:
+        item = change["fullDocument"]
+        try:
+            guild = bot.get_guild(item["guild_id"])
+            user = bot.get_user(item["user_id"]) or await bot.fetch_user(item["user_id"])
+            channel = next((c for c in guild.text_channels if c.permissions_for(guild.me).create_instant_invite), None) if guild else None
+            if not channel:
+                raise RuntimeError("No channel is available for creating an invite")
+            invite = await channel.create_invite(max_age=604800, max_uses=1, reason="Scheduled moderation rejoin invite")
+            await user.send(f"You may rejoin **{guild.name}**: {invite.url}")
+            scheduled_invites_collection.update_one({"_id": item["_id"]}, {"$set": {"status": "sent", "sent_at": discord.utils.utcnow()}})
+            await send_mod_log(guild, "Rejoin invite sent", f"A scheduled invite was sent to <@{item['user_id']}>.", 0x2ECC71)
+        except Exception as exc:
+            print(f"[ERROR] scheduled invite: {exc}")
+            scheduled_invites_collection.update_one({"_id": item["_id"]}, {"$set": {"status": "failed", "error": str(exc)}})
 
 @bot.event
 async def on_member_join(member):
@@ -2279,12 +2354,17 @@ async def on_message(message):
         return
 
     if message.guild:
-      
-        guild_filter_words = load_filter_words(message.guild.id)
+        guild_id = message.guild.id
+        guild_filter_words = load_filter_words(guild_id)
+        filter_enabled = _filter_cache[guild_id][0]
 
-        message_lower = message.content.lower()
-        for word in guild_filter_words:
-            if word.lower() in message_lower:
+        if filter_enabled and guild_filter_words:
+            message_lower = message.content.lower()
+            # Create a regex pattern that matches any of the filter words
+            pattern = re.compile(r"\b" + "\b|\b".join(map(re.escape, guild_filter_words)) + "\b", re.IGNORECASE)
+            matches = pattern.findall(message_lower)
+
+            if matches:
                 try:
                     await message.delete()
                     embed = discord.Embed(
@@ -2295,7 +2375,9 @@ async def on_message(message):
                     embed.set_footer(text="Message deleted by chat filter")
                     await message.channel.send(embed=embed, delete_after=5)
 
-                    
+                    # Log all matched words
+                    matched_words = "\n".join(f"||{word}||" for word in set(matches))
+
                     await send_mod_log(
                         guild=message.guild,
                         title="🚫 Message Filtered",
@@ -2304,7 +2386,7 @@ async def on_message(message):
                         fields=[
                             ("User", f"{message.author} ({message.author.id})", True),
                             ("Channel", message.channel.mention, True),
-                            ("Filtered Word", f"||{word}||", True),
+                            ("Filtered Words", matched_words, True),
                         ],
                         thumbnail=(
                             message.author.avatar.url if message.author.avatar else None
@@ -2317,6 +2399,19 @@ async def on_message(message):
                     print(f"❌ Error deleting message: {e}")
 
         await bot.process_commands(message)
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Give users a clear response when they use an unknown bread command."""
+    if isinstance(error, commands.CommandNotFound):
+        command_name = ctx.message.content.removeprefix("bread ").split(maxsplit=1)[0]
+        await ctx.send(
+            f"❌ Command `{command_name}` was not found. Use `bread help` to see available commands.",
+            delete_after=15,
+        )
+        return
+    print(f"[COMMAND ERROR] {error}")
 
 
 @bot.tree.command(name="filter", description="Manage the chat filter")
@@ -2333,7 +2428,7 @@ async def on_message(message):
     ]
 )
 async def filter_command(
-    interaction: discord.Interaction, action: str, word: Optional[str] = None
+    interaction: discord.Interaction, action: str, word: str = None
 ):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message(
@@ -2434,9 +2529,9 @@ async def filter_command(
                 )
 
         except Exception as e:
-            print(f"[ERROR] Error in filter remove: {str(e)}")
+            print(f"[ERROR] Error in filter remove: {e!s}")
             await interaction.response.send_message(
-                f"❌ An error occurred while removing the word: {str(e)}",
+                f"❌ An error occurred while removing the word: {e!s}",
                 ephemeral=True,
             )
 
@@ -2501,7 +2596,7 @@ async def filter_command(
         embed.add_field(name="Status", value="Enabled", inline=True)
         embed.set_footer(text=f"Reset by {interaction.user.name}")
         await interaction.response.send_message(embed=embed, ephemeral=True)
-        set_filter_enabled(guild_id, False)
+        set_filter_enabled(guild_id, True)
         current_words = load_filter_words(guild_id)
 
         embed_disabled = discord.Embed(
@@ -2544,6 +2639,13 @@ async def filter_command(
 
     elif action == "status":
         current_words = load_filter_words(guild_id)
+        enabled = _filter_cache[guild_id][0]
+        embed = discord.Embed(
+            title="Chat Filter Status", color=0x00FF00 if enabled else 0xFF9900
+        )
+        embed.add_field(
+            name="Status", value="Enabled" if enabled else "Disabled", inline=True
+        )
         embed.add_field(
             name="Filtered Words", value=str(len(current_words)), inline=True
         )
@@ -2759,7 +2861,7 @@ async def filter(ctx, action=None, *, word=None):
     help="Set the log channel for moderation logs",
 )
 @commands.has_permissions(manage_channels = True)
-async def setlog(ctx, channel: Optional[discord.TextChannel] = None):
+async def setlog(ctx, channel: discord.TextChannel = None):
     """Set the log channel for moderation logs (prefix command)"""
     if not channel:
         channel = ctx.channel
@@ -2789,7 +2891,7 @@ async def setlog(ctx, channel: Optional[discord.TextChannel] = None):
         )
 
     except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
+        await ctx.send(f"❌ Error: {e!s}")
 
 
 @bot.command(
@@ -2825,7 +2927,7 @@ async def getchannels(ctx):
         await ctx.send(embed=embed)
 
     except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
+        await ctx.send(f"❌ Error: {e!s}")
 
 
 @bot.tree.command(name="getchannels", description="Show current channel configuration")
@@ -2857,7 +2959,7 @@ async def get_channels(interaction: discord.Interaction):
 
     except Exception as e:
         await interaction.response.send_message(
-            f"❌ An error occurred: {str(e)}", ephemeral=True
+            f"❌ An error occurred: {e!s}", ephemeral=True
         )
 
 
@@ -2953,6 +3055,7 @@ async def help(ctx, *, command_name=None):
             "getchannels": "`bread getchannels`\n`bread channels` (alternative)",
             "setchannel": "`bread setchannel #log-channel #welcome-channel`\n`bread setchannel #log-channel` (set only log)\n`bread setchannel` (use current channel for both)",
             "setlogchannel": "Alias for `setlog`",
+            "broadcast": "`bread broadcast Hello everyone!`\n`bread broadcast ping Important announcement!`",
         }
 
         if command.name in examples:
@@ -3046,6 +3149,7 @@ async def help(ctx, *, command_name=None):
             ),
             ("setwelcome [#channel]", "Set welcome channel for new members"),
             ("setlogchannel [#channel]", "Set channel for moderation logs"),
+            ("broadcast <message>", "Send a message to all text channels"),
         ]
 
         admin_text = "\n".join(
@@ -3139,8 +3243,9 @@ async def me(ctx):
 
 @bot.tree.command(name="help", description="Show bot commands and usage")
 @app_commands.describe(command="Specific command to get help for")
-async def slash_help(interaction: discord.Interaction, command: Optional[str] = None):
+async def slash_help(interaction: discord.Interaction, command: str = None):
     admin_commands = [
+        "broadcast",
         "kick",
         "ban",
         "mute",
@@ -3267,6 +3372,11 @@ async def slash_help(interaction: discord.Interaction, command: Optional[str] = 
                 "usage": "`/getchannels` or `bread getchannels`",
                 "example": "`/getchannels`\n`bread getchannels`",
             },
+            "broadcast": {
+                "description": "Send a message to all channels in the server",
+                "usage": "`/broadcast message:<text> [ping:<true/false>]` or `bread broadcast [message]`",
+                               "example": "`/broadcast message:Server restart in 5 minutes ping:true`\n`bread broadcast ping Server restart in 5 minutes`",
+            },
         }.get(command.lower())
 
         if not command_info:
@@ -3286,7 +3396,7 @@ async def slash_help(interaction: discord.Interaction, command: Optional[str] = 
         embed.add_field(name="Examples", value=command_info["example"], inline=False)
 
         # Add required permissions if any
-        if command.lower() in ["filter", "setwelcome", "setlogchannel", "setchannel"]:
+        if command.lower() in ["filter", "setwelcome", "setlogchannel", "broadcast", "setchannel"]:
             embed.add_field(
                 name="Required Permissions", value="Administrator", inline=False
             )
@@ -3405,6 +3515,10 @@ async def slash_help(interaction: discord.Interaction, command: Optional[str] = 
                 "Set the log channel (current channel if none specified)",
             ),
             (
+                "/broadcast [message] | bread broadcast [message]",
+                "Send a message to all channels",
+            ),
+            (
                 "/setchannel [#log] [#welcome]",
                 "Set both log and welcome channels at once",
             ),
@@ -3448,7 +3562,7 @@ async def setwelcome(ctx, channel: discord.TextChannel = None):
 
         await ctx.send(f"✅ Welcome channel set to {channel.mention}")
     except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
+        await ctx.send(f"❌ Error: {e!s}")
 
     global WELCOME_CHANNEL_ID
     WELCOME_CHANNEL_ID = channel.id
@@ -3472,6 +3586,8 @@ async def setwelcome(ctx, channel: discord.TextChannel = None):
 @commands.has_permissions(ban_members=True)
 async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
     """Ban a member from the server (prefix command)"""
+    await ctx.send("Use `/ban` so the required reason and evidence form is recorded.")
+    return
     if not ctx.guild.me.guild_permissions.ban_members:
         await ctx.send("❌ I don't have permission to ban members!")
         return
@@ -3597,7 +3713,7 @@ async def slash_status(interaction: discord.Interaction):
 async def slash_unmute(
     interaction: discord.Interaction,
     member: discord.Member,
-    reason: str = "No reason provided",
+    reason: str,
 ):
     """Unmute a member (slash command)"""
     # Check if user has moderate members permissions
@@ -3792,261 +3908,7 @@ async def status(ctx):
     )
 
     embed.set_footer(text=f"Requested by {ctx.author.name}")
-    await ctx.send(embed=embed) 
-
-
-async def fetch_nasa_apod(use_cache=False):
-    """Fetch NASA's Astronomy Picture of the Day (APOD) and return an Embed."""
-    global _nasa_apod_cache, _nasa_apod_cache_time
-
-    # Check if we should use the cache
-    if use_cache and _nasa_apod_cache and _nasa_apod_cache_time:
-        # Cache is valid for 24 hours
-        cache_age = (discord.utils.utcnow() - _nasa_apod_cache_time).total_seconds()
-        if cache_age < 86400:  # 24 hours in seconds
-            # _nasa_apod_cache may be stored as (embed, image_bytes) or just embed
-            cache_entry = _nasa_apod_cache
-            if isinstance(cache_entry, tuple) and len(cache_entry) == 2:
-                cached_embed, cached_bytes = cache_entry
-                if cached_bytes:
-                    try:
-                        file = discord.File(fp=BytesIO(cached_bytes), filename="apod.jpg")
-                        return cached_embed, file
-                    except Exception:
-                        return cached_embed, None
-                return cached_embed, None
-            else:
-                return cache_entry, None
-    
-    try:
-        nasa_api_key = os.getenv("NASA_API_KEY")
-        if not nasa_api_key:
-            raise RuntimeError("No NASA API key found in .env")
-
-        url = f"https://api.nasa.gov/planetary/apod?api_key={nasa_api_key}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    txt = await resp.text()
-                    try:
-                        txt = await resp.text()
-                    except Exception as e:
-                        raise RuntimeError(f"NASA APOD API error: {resp.status} - {str(e)}") from e
-                data = await resp.json()
-                
-        # Update cache with new data
-        _nasa_apod_cache_time = discord.utils.utcnow()
-
-        title = data.get("title", "Astronomy Picture of the Day")
-        date = data.get("date", "Unknown Date")
-        explanation = data.get("explanation", "No description available.")
-        image_url = data.get("url")
-        hd_url = data.get("hdurl", image_url)
-        credit = data.get("copyright", "NASA")
-        media_type = data.get("media_type", "image")
-
-
-        embed = discord.Embed(
-            title=title,
-            description=(explanation[:2048] if explanation and len(explanation) > 2048 else explanation),
-            color=0x1E4D80,
-            timestamp=discord.utils.utcnow(),
-        )
-
-        # Always add an HD/source link field when available so users can open the image
-        if hd_url:
-            try:
-                embed.add_field(name="🔍 HD Version", value=f"[Click here]({hd_url})", inline=True)
-            except Exception:
-                # If embedding the markdown link fails for any client, add a plain URL fallback
-                embed.add_field(name="🔍 HD Version", value=hd_url, inline=True)
-
-        if media_type == "image" and image_url:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(image_url) as img_resp:
-                    if img_resp.status != 200:
-                        raise RuntimeError(f"Failed to fetch image: {img_resp.status}")
-                    img_data = await img_resp.read()
-                    if img_data is None:
-                        raise RuntimeError("img_data is null")
-                    try:
-                        file = discord.File(fp=BytesIO(img_data), filename="apod.jpg")
-                    except Exception as e:
-                        print(f"Exception in creating discord.File: {e}")
-                        traceback.print_exc()
-                        raise e
-                    embed.set_image(url="attachment://apod.jpg")
-                    embed.add_field(name="🔍 HD Version", value=f"[Click here]({hd_url})", inline=True)
-                    # Cache embed and raw bytes so we can reattach later
-                    _nasa_apod_cache = (embed, img_data)
-                    return embed, file
-        elif media_type == "video" and image_url:
-            # For videos, include a watch link and set thumbnail if possible
-            try:
-                embed.add_field(name="🎥 Video Link", value=f"[Watch Video]({image_url})", inline=False)
-            except Exception:
-                embed.add_field(name="🎥 Video Link", value=image_url, inline=False)
-
-        # If we didn't attach an image (image branch would have returned already), set the image URL so Discord can preview it
-        try:
-            if image_url:
-                embed.set_image(url=image_url)
-        except Exception:
-            pass
-
-        embed.add_field(name="📅 Date", value=date, inline=True)
-        embed.add_field(name="©️ Credit", value=credit, inline=True)
-
-        # Cache the embed (no attached image bytes)
-        _nasa_apod_cache = (embed, None)
-
-        return embed, None
-    except Exception as e:
-        print("[ERROR] Exception in fetch_nasa_apod function:")
-        traceback.print_exc()
-        raise e
-
-
-@bot.command(name="apod_cache", aliases=["cache_nasa"])
-async def apod_cache_cmd(ctx):
-    """Manually add an APOD to the cache"""
-    if not await bot.is_owner(ctx.author):
-        await ctx.send("❌ Only the bot owner can use this command!")
-        return
-        
-    sample_data = {
-        "title": "Galaxy M74: The Perfect Spiral",
-        "explanation": "If not perfect, then this spiral galaxy is at least one of the most photogenic. An island universe containing billions of stars and situated about 32 million light-years away toward the constellation of Pisces, M74 presents a gorgeous face-on view.",
-        "url": "https://images-ext-1.discordapp.net/external/sdoLakz4lb5l4z2vrYbiFKEuKE0OQbftWbP9tqsMQwc/https/apod.nasa.gov/apod/image/2210/M74_HubbleGendler_1080.jpg",
-        "hdurl": "https://apod.nasa.gov/apod/image/2210/M74_HubbleGendler_3000.jpg",
-        "date": "2022-10-22",
-        "copyright": "NASA, ESA, Hubble; Processing: Judy Schmidt",
-        "media_type": "image"
-    }
-
-    embed = discord.Embed(
-        title=sample_data["title"],
-        description=sample_data["explanation"],
-        color=0x1E4D80,
-        timestamp=discord.utils.utcnow(),
-    )
-
-    embed.set_image(url=sample_data["url"])
-    if sample_data["hdurl"] and sample_data["hdurl"] != sample_data["url"]:
-        embed.add_field(name="🔍 HD Version", value=f"[Click here]({sample_data['hdurl']})", inline=True)
-
-    embed.add_field(name="📅 Date", value=sample_data["date"], inline=True)
-    embed.add_field(name="©️ Credit", value=sample_data["copyright"], inline=True)
-
-    global _nasa_apod_cache, _nasa_apod_cache_time
-    _nasa_apod_cache = (embed, None)
-    _nasa_apod_cache_time = discord.utils.utcnow()
-
-    await ctx.send("✅ Added sample APOD to cache! Testing cache now...", embed=embed)
-    
-@bot.command(name="apod", aliases=["nasa", "space_pic"]) 
-async def apod_cmd(ctx):
-    """Prefix command: bread apod - show NASA's Astronomy Picture of the Day"""
-    try:
-        async with ctx.typing():
-            last_exc = None
-            try:
-                embed, file = await fetch_nasa_apod(use_cache=False)
-                last_exc = None
-            except Exception as e:
-                last_exc = e
-                try:
-                    await ctx.send("⚠️ NASA APOD failed; retrying with cache...", delete_after=5)
-                except Exception:
-                    pass
-                try:
-                    embed, file = await fetch_nasa_apod(use_cache=True)
-                    last_exc = None
-                except Exception as e:
-                    last_exc = e
-
-            if last_exc:
-                await ctx.send(f"❌ {last_exc}")
-                return
-
-            embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
-            if file:
-                await ctx.send(embed=embed, file=file)
-            else:
-                await ctx.send(embed=embed)
-    except Exception as e:
-        await ctx.send(f"❌ {e}")
-
-
-@bot.tree.command(name="apod_cache", description="[Owner Only] Add a sample APOD to the cache")
-async def apod_cache_slash(interaction: discord.Interaction):
-    if not await bot.is_owner(interaction.user):
-        await interaction.response.send_message("❌ Only the bot owner can use this command!", ephemeral=True)
-        return
-        
-    await interaction.response.defer()
-    
-    sample_data = {
-        "title": "Galaxy M74: The Perfect Spiral",
-        "explanation": "If not perfect, then this spiral galaxy is at least one of the most photogenic. An island universe containing billions of stars and situated about 32 million light-years away toward the constellation of Pisces, M74 presents a gorgeous face-on view.",
-        "url": "https://apod.nasa.gov/apod/image/2210/M74_HubbleGendler_1080.jpg",
-        "hdurl": "https://apod.nasa.gov/apod/image/2210/M74_HubbleGendler_3000.jpg",
-        "date": "2022-10-22",
-        "copyright": "NASA, ESA, Hubble; Processing: Judy Schmidt",
-        "media_type": "image"
-    }
-
-    embed = discord.Embed(
-        title=sample_data["title"],
-        description=sample_data["explanation"],
-        color=0x1E4D80,
-        timestamp=discord.utils.utcnow(),
-    )
-
-    embed.set_image(url=sample_data["url"])
-    if sample_data["hdurl"] and sample_data["hdurl"] != sample_data["url"]:
-        embed.add_field(name="🔍 HD Version", value=f"[Click here]({sample_data['hdurl']})", inline=True)
-
-    embed.add_field(name="📅 Date", value=sample_data["date"], inline=True)
-    embed.add_field(name="©️ Credit", value=sample_data["copyright"], inline=True)
-
-    global _nasa_apod_cache, _nasa_apod_cache_time
-    _nasa_apod_cache = (embed, None)
-    _nasa_apod_cache_time = discord.utils.utcnow()
-
-    await interaction.followup.send("✅ Added sample APOD to cache! Testing cache now...", embed=embed)
-
-@bot.tree.command(name="apod", description="Get NASA's Astronomy Picture of the Day")
-async def apod_slash(interaction: discord.Interaction):
-    await interaction.response.defer()
-    try:
-        last_exc = None
-        try:
-            embed, file = await fetch_nasa_apod(use_cache=False)
-            last_exc = None
-        except Exception as e:
-            last_exc = e
-            try:
-                await interaction.followup.send("⚠️ NASA APOD failed; retrying with cache...")
-            except Exception:
-                pass
-            try:
-                embed, file = await fetch_nasa_apod(use_cache=True)
-                last_exc = None
-            except Exception as e:
-                last_exc = e
-
-        if last_exc:
-            await interaction.followup.send(f"❌ {last_exc}", ephemeral=True)
-            return
-
-        embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
-        if file:
-            await interaction.followup.send(embed=embed, file=file)
-        else:
-            await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+    await ctx.send(embed=embed)
 
 
 @bot.tree.command(
@@ -4120,210 +3982,6 @@ async def lock(
         await interaction.response.send_message(
             f"❌ An error occurred: {e}", ephemeral=True
         )
-
-
-@bot.tree.command(name="lockdown", description="Completely lock a channel (slash command)")
-@app_commands.describe(
-    channel="Channel to completely lock (current channel if not specified)"
-)
-async def slash_completelock(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel = None
-):
-    """Completely lock a channel (slash command)"""
-    if not channel:
-        channel = interaction.channel
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "❌ You need administrator permissions to use this command!",
-            ephemeral=True,
-        )
-        return
-    if not interaction.guild.me.guild_permissions.manage_channels:
-        await interaction.response.send_message(
-            "❌ I don't have permission to modify channels!", ephemeral=True
-        )
-        return
-    
-    # Build a dictionary of overwrites for all roles
-    overwrites = {}
-    
-    # Lock down @everyone
-    overwrites[interaction.guild.default_role] = discord.PermissionOverwrite(
-        send_messages=False,
-        create_public_threads=False,
-        create_private_threads=False,
-        add_reactions=False
-    )
-    
-    # Process all other roles
-    for role in interaction.guild.roles:
-        # Skip @everyone since we already handled it
-        if role == interaction.guild.default_role:
-            continue
-            
-        # Check if role has admin or manage_messages permissions
-        if role.permissions.administrator or role.permissions.manage_messages:
-            # Allow these roles to bypass the lockdown
-            overwrites[role] = discord.PermissionOverwrite(
-                send_messages=True,
-                create_public_threads=True,
-                create_private_threads=True,
-                add_reactions=True
-            )
-        else:
-            # Lock down all other roles
-            overwrites[role] = discord.PermissionOverwrite(
-                send_messages=False,
-                create_public_threads=False,
-                create_private_threads=False,
-                add_reactions=False
-            )
-
-    await channel.edit(overwrites=overwrites)
-
-    await send_mod_log(
-        guild=interaction.guild,
-        title="🔒 Channel Completely Locked",
-        description=f"{channel.mention} has been completely locked.",
-        color=0xFF0000,
-        fields=[
-            ("Channel", channel.mention, True),
-            ("Moderator", interaction.user.mention, True),
-        ],
-    )
-    await interaction.response.send_message(
-        f"✅ {channel.mention} has been completely locked! Only administrators and roles with Manage Messages can interact.",
-        ephemeral=True,
-    )
-
-@bot.tree.command(name="unlockdown", description="Completely unlock a channel (slash command)")
-@app_commands.describe(
-    channel="Channel to completely unlock (current channel if not specified)"
-)
-async def slash_completeunlock(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel = None
-):
-    """Completely unlock a channel (slash command)"""
-    if not channel:
-        channel = interaction.channel
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "❌ You need administrator permissions to use this command!",
-            ephemeral=True,
-        )
-        return
-    if not interaction.guild.me.guild_permissions.manage_channels:
-        await interaction.response.send_message(
-            "❌ I don't have permission to modify channels!", ephemeral=True
-        )
-        return
-    
-    # Build a dictionary of overwrites for all roles
-    overwrites = {}
-    
-    # Unlock @everyone
-    overwrites[interaction.guild.default_role] = discord.PermissionOverwrite(
-        send_messages=True,
-        create_public_threads=True,
-        create_private_threads=True,
-        add_reactions=True
-    )
-    
-    # Process all other roles
-    for role in interaction.guild.roles:
-        # Skip @everyone since we already handled it
-        if role == interaction.guild.default_role:
-            continue
-            
-        # Check if role has admin or manage_messages permissions
-        if role.permissions.administrator or role.permissions.manage_messages:
-            # Allow these roles to send messages
-            overwrites[role] = discord.PermissionOverwrite(
-                send_messages=True,
-                create_public_threads=True,
-                create_private_threads=True,
-                add_reactions=True
-            )
-        else:
-            # Unlock all other roles
-            overwrites[role] = discord.PermissionOverwrite(
-                send_messages=True,
-                create_public_threads=True,
-                create_private_threads=True,
-                add_reactions=True
-            )
-
-    await channel.edit(overwrites=overwrites)
-
-    await send_mod_log(
-        guild=interaction.guild,
-        title="🔓 Channel Completely Unlocked",
-        description=f"{channel.mention} has been completely unlocked.",
-        color=0x00FF00,
-        fields=[
-            ("Channel", channel.mention, True),
-            ("Moderator", interaction.user.mention, True),
-        ],
-    )
-    await interaction.response.send_message(
-        f"✅ {channel.mention} has been completely unlocked!",
-        ephemeral=True,
-    )
-
-
-@bot.command(name="unlockdown", aliases=["unlockcompletely"])
-@commands.has_permissions(administrator=True)
-async def unlockdown(ctx, channel: discord.TextChannel = None):
-    """Completely unlock a channel for everyone"""
-    if not channel or not isinstance(channel, discord.TextChannel):
-        await ctx.send("❌ Please specify a valid text channel to unlock completely!")
-        return
-
-    # Base overwrite for everyone
-    everyone_role = ctx.guild.default_role
-    overwrites = channel.overwrites.copy()  # Copy current overwrites
-
-    # Unlock for @everyone
-    overwrites[everyone_role] = discord.PermissionOverwrite(
-        send_messages=True,
-        create_public_threads=True,
-        create_private_threads=True,
-        add_reactions=True
-    )
-
-    # Unlock for other non-admin roles
-    for role in ctx.guild.roles:
-        if role.permissions.administrator or role.permissions.manage_messages:
-            continue
-        overwrites[role] = discord.PermissionOverwrite(
-            send_messages=True,
-            create_public_threads=True,
-            create_private_threads=True,
-            add_reactions=True
-        )
-
-    await channel.edit(overwrites=overwrites)
-
-    embed = discord.Embed(
-        title="🔓 Channel Completely Unlocked",
-        description=f"{channel.mention} has been completely unlocked.",
-        color=0x00FF00,
-    )
-    embed.add_field(name="Moderator", value=ctx.author.mention, inline=False)
-    await ctx.send(embed=embed)
-
-    await send_mod_log(
-        guild=ctx.guild,
-        title="🔓 Channel Completely Unlocked",
-        description=f"{channel.mention} has been completely unlocked.",
-        color=0x00FF00,
-        fields=[
-            ("Channel", channel.mention, True),
-            ("Moderator", ctx.author.mention, True),
-        ],
-    )
 
 
 @bot.tree.command(
@@ -4435,51 +4093,49 @@ async def unban(ctx, user: discord.User, *, reason="No reason provided"):
 
 @bot.command()
 @commands.has_permissions(moderate_members=True)
-async def unmute(ctx, target: discord.Member, *, reason="No reason provided"):
+async def unmute(ctx, member: discord.Member, *, reason="No reason provided"):
     """Unmute a member (prefix command)"""
     if not ctx.guild.me.guild_permissions.moderate_members:
         await ctx.send("❌ I don't have permission to unmute members!")
         return
 
-    # Check if target is actually muted
-    # For discord.py 2.x, use the timed_out_until property to check if the member is muted
-    if not getattr(target, "timed_out_until", None) or (target.timed_out_until is not None and target.timed_out_until < discord.utils.utcnow()):
-        await ctx.send(f"❌ {target.mention} is not muted!")
+    # Check if member is actually muted
+    if not member.is_timed_out():
+        await ctx.send(f"❌ {member.mention} is not muted!")
         return
+
     try:
         # Send DM to the user before unmuting
         try:
-            await target.send(
+            await member.send(
                 f"You have been unmuted in **{ctx.guild.name}**.\nReason: {reason}"
             )
         except:
             pass  # User has DMs disabled or blocked the bot
 
-        # Remove the timeout only if the member is actually muted
-        if target.timed_out_until and target.timed_out_until > discord.utils.utcnow():
-            await target.timeout(None, reason=f"{reason} (unmuted by {ctx.author})")
-            # Send confirmation message
-            await ctx.send(f"✅ {target.mention} has been unmuted!\nReason: {reason}")
-        else:
-            await ctx.send(f"ℹ️ {target.mention} is not currently muted.")
+        # Remove the timeout
+        await member.timeout(None, reason=f"{reason} (unmuted by {ctx.author})")
+
+        # Send confirmation message
+        await ctx.send(f"✅ {member.mention} has been unmuted!\nReason: {reason}")
 
         # Log the unmute
         await send_mod_log(
             guild=ctx.guild,
             title="🔊 Member Unmuted",
-            description=f"{target.mention} has been unmuted.",
+            description=f"{member.mention} has been unmuted.",
             color=0x00FF00,
             fields=[
-                ("User", f"{target} ({target.id})", False),
+                ("User", f"{member} ({member.id})", False),
                 ("Moderator", ctx.author.mention, True),
                 ("Reason", reason, True),
                 (
                     "Account Created",
-                    discord.utils.format_dt(target.created_at, "R"),
+                    discord.utils.format_dt(member.created_at, "R"),
                     True,
                 ),
             ],
-            thumbnail=target.avatar.url if target.avatar else "",
+            thumbnail=member.avatar.url if member.avatar else None,
         )
 
     except discord.Forbidden:
@@ -4490,12 +4146,12 @@ async def unmute(ctx, target: discord.Member, *, reason="No reason provided"):
         await send_mod_log(
             guild=ctx.guild,
             title="❌ Unmute Failed",
-            description=f"Failed to unmute {target.mention}",
+            description=f"Failed to unmute {member.mention}",
             color=0xFF0000,
             fields=[
                 ("Error", str(e), False),
                 ("Moderator", ctx.author.mention, True),
-                ("Target", f"{target} ({target.id})", True),
+                ("Target", f"{member} ({member.id})", True),
             ],
         )
 
@@ -4584,7 +4240,6 @@ async def lock(
                 ("Channel", target_channel.mention, True),
             ],
         )
-
 
 
 @bot.command()
@@ -4680,64 +4335,6 @@ async def unlock(
             ],
         )
 
-@bot.command(name="lockdown", aliases=["completelock"])
-@commands.has_permissions(administrator=True)
-async def completelock(ctx, channel: discord.TextChannel = None):
-    if not channel or not isinstance(channel, discord.TextChannel):
-        await ctx.send("❌ Please specify a valid text channel to lock completely!")
-        return
-
-    # Build a dictionary of overwrites for all roles
-    overwrites = {}
-    
-    # Lock down @everyone
-    overwrites[ctx.guild.default_role] = discord.PermissionOverwrite(
-        send_messages=False,
-        create_public_threads=False,
-        create_private_threads=False,
-        add_reactions=False
-    )
-    
-    # Process all other roles
-    for role in ctx.guild.roles:
-        # Skip @everyone since we already handled it
-        if role == ctx.guild.default_role:
-            continue
-            
-        # Check if role has admin or manage_messages permissions
-        if role.permissions.administrator or role.permissions.manage_messages:
-            # Allow these roles to bypass the lockdown
-            overwrites[role] = discord.PermissionOverwrite(
-                send_messages=True,
-                create_public_threads=True,
-                create_private_threads=True,
-                add_reactions=True
-            )
-        else:
-            # Lock down all other roles
-            overwrites[role] = discord.PermissionOverwrite(
-                send_messages=False,
-                create_public_threads=False,
-                create_private_threads=False,
-                add_reactions=False
-            )
-
-    await channel.edit(overwrites=overwrites)
-
-    await send_mod_log(
-        guild=ctx.guild,
-        title="🔒 Channel Completely Locked",
-        description=f"{channel.mention} has been completely locked.",
-        color=0xFF0000,
-        fields=[
-            ("Channel", channel.mention, True),
-            ("Moderator", ctx.author.mention, True),
-        ],
-    )
-    await ctx.send(f"✅ {channel.mention} has been completely locked! Only administrators and roles with Manage Messages can interact.")
-
-
-    
 
 @bot.command()
 @commands.is_owner()
@@ -4752,7 +4349,7 @@ async def lalala(ctx):
         return (
             m.author == ctx.author
             and m.channel == ctx.channel
-            and m.content.lower() in ["nico nachos tacos"]
+            and m.content.lower() == "yes"
         )
 
     try:
@@ -4766,9 +4363,10 @@ async def lalala(ctx):
         await ctx.send(f"❌ Error during shutdown: {e}")
 
 
-flask_thread = threading.Thread(target=run_flask)
-flask_thread.daemon = True
-flask_thread.start()
-print("hello world")
-bot.run(token, log_handler=handler, log_level=logging.DEBUG)
-
+if __name__ == "__main__":
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN is not set")
+    check_mongodb_connection()
+    flask_thread = start_flask_thread()
+    bot.run(token, log_handler=handler, log_level=logging.INFO)
+    print("Hello World")
