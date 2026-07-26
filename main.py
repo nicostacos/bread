@@ -146,11 +146,11 @@ async def on_message(message):
     if message.author == bot.user:
         return
     
-    # Handle DMs
+    # Block ALL commands in DMs (both prefix and slash)
     if isinstance(message.channel, discord.DMChannel):
-        if message.content.startswith("bread "):
+        if message.content.startswith("bread ") or message.content.startswith("/"):
             await message.channel.send(
-                "Hello! You cannot use prefix commands in DMs, use slash commands instead."
+                "❌ You cannot use commands in DMs. Please use commands in a server."
             )
         return
     
@@ -159,10 +159,20 @@ async def on_message(message):
         # Check for blacklisted users before processing commands
         try:
             ctx = await bot.get_context(message)
+            if ctx.command is None:
+                # No command found - send help message
+                await message.channel.send(
+                    f"❌ Command not found. Use `{ctx.prefix}help` for a list of commands."
+                )
+                return
             await global_prefix_block_check(ctx)
             await bot.process_commands(message)
-        except Exception:
-            pass
+        except commands.CommandNotFound:
+            await message.channel.send(
+                f"❌ Command not found. Use `{bot.command_prefix}help` for a list of commands."
+            )
+        except Exception as e:
+            print(f"[ERROR] Processing command: {e}")
         return
     
     # Filter messages in guilds
