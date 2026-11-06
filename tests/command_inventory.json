@@ -1,0 +1,39 @@
+{
+  "slash": [
+    "apod",
+    "ban",
+    "blacklist",
+    "botinfo",
+    "broadcast",
+    "coin_toss",
+    "filter",
+    "get_channels",
+    "hello",
+    "help",
+    "kick",
+    "mute",
+    "ping",
+    "purge",
+    "serverinfo",
+    "setlog",
+    "setwelcome",
+    "test",
+    "unban",
+    "unkick",
+    "userinfo",
+    "warn",
+    "warnings"
+  ],
+  "prefix": [
+    "blacklist",
+    "filter",
+    "getchannels",
+    "hello",
+    "help",
+    "kick",
+    "setlog",
+    "setwelcome",
+    "warn",
+    "warnings"
+  ]
+}

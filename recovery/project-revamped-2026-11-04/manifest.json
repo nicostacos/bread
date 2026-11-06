@@ -1,0 +1,142 @@
+﻿[
+    {
+        "File":  "Bread_bot\\.env",
+        "SHA256":  "1077CE13B4A6C8BE570338307A28D670309B4400B268DD6FC88A0966BA81E826",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\.gitattributes",
+        "SHA256":  "D8FB0DE4792538F93822B2C0D235604921299D5E54A3D6EC7A6CB34536E8BF1E",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\.gitignore",
+        "SHA256":  "5FF7D42B474FABB4DBF1D2D3F8AB72E7A38B82FBD385CB47D674B7522D15572E",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\config.py",
+        "SHA256":  "95F07A3389680EFD459B477154FFA8C4C9D88143F9FCC45B234B7AE58210953A",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\discord.log",
+        "SHA256":  "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\main.py",
+        "SHA256":  "4C0B98AA58B23BCC69C07E90458DD639E711AB00D214A8C66807387777CBC1F7",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\README.md",
+        "SHA256":  "BDAF4ED9C005E056095C27DBB0F7B00D5B10F1A70B5BDA00FF8117DCBF25BBA3",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\requirements.txt",
+        "SHA256":  "D1158E034C48798FF1BC3CCE68F207DD759677F39102C6076457C9146C9F3968",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\SECURITY.md",
+        "SHA256":  "64B1AD874BE2255BD7A7AC12CA67EA78717E075138B26AC8EF829FBD7E7627EF",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\webhook_utils.md",
+        "SHA256":  "DB1A7F9342027CE72E41D024C901B9ECA6F4412BFB31A4F22FF70F557C6249A8",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\cogs\\admin.py",
+        "SHA256":  "7F8EF96E93507822EA89EF3D1F0F6447E9A6AC50C59E608FBE475CB10E5CBD8C",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\cogs\\moderation.py",
+        "SHA256":  "65303D66A98F0553BEF33CD83C45A8C191C3109BCDEE5CCC9E68B8F17D97204E",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\cogs\\nasa.py",
+        "SHA256":  "016F9CBF779C9DE807804B37B8BF85E27B9195DEB8EF6D90D1553E5D32EEBB6A",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\cogs\\utilities.py",
+        "SHA256":  "FADC20DDE83D90219AD82D9B4783D51396E23FD403FEB05C5E65102CC259A0D6",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\cogs\\__init__.py",
+        "SHA256":  "AE5890C7DF86AF504A30A8F62DD768EC198DBDF477A273638DDBE31F05E251C4",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\cogs\\__pycache__\\admin.cpython-314.pyc",
+        "SHA256":  "8B86C560E2EA9276E5FEDD5F69DFFADC79B4A21B977E1EF7131D9B03BA41BA5B",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\cogs\\__pycache__\\moderation.cpython-314.pyc",
+        "SHA256":  "A08182F84A44D2E1D3D979F009D86DDC5045072A045A08873F9F4FC79F85F227",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\cogs\\__pycache__\\nasa.cpython-314.pyc",
+        "SHA256":  "1AFDCB2732A028DBCA05CC1033137D9148283DABA56EBED0A7BE72070E87F2DA",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\cogs\\__pycache__\\utilities.cpython-314.pyc",
+        "SHA256":  "E0C9AFCCC3345F85A0F4323A3563C6DC28A6E555CB65ECBA3FCC8412D299DA41",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\cogs\\__pycache__\\__init__.cpython-314.pyc",
+        "SHA256":  "4AFC5A00AE9D709E35A3B8768A0339956F6FC98655851766C79BB5CBE8AA396C",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\events\\events.py",
+        "SHA256":  "6C7301F3789DAA28BAB97841358C1A757A9DCFA1F699B78A356314561BACB6C7",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\events\\__pycache__\\events.cpython-314.pyc",
+        "SHA256":  "8B288E58B9AF4DC66FD6836A0EEFE78E28FDA153C98C786C3AD1742C657F4098",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\utils\\config_manager.py",
+        "SHA256":  "4981D21E7F81D463FC9E339EA3906B42040770D20D74BE7495BCCD74E23A3737",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\utils\\database.py",
+        "SHA256":  "EC3DA31B6955C96E1726B895F4001DCDE5593EC303E0D2D318FA722CFA1B9035",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\utils\\helpers.py",
+        "SHA256":  "C52BD9E3CF76D5DD2459B2893A09376542246B5F2F024976BC47F1B19374B964",
+        "PreservedIn":  "canonical"
+    },
+    {
+        "File":  "Bread_bot\\utils\\__pycache__\\config_manager.cpython-314.pyc",
+        "SHA256":  "84E360BEC0BB04046F5EDE2BAF270DA45A72B350FAD0810754AD472334D5F145",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\utils\\__pycache__\\database.cpython-314.pyc",
+        "SHA256":  "C04A50CF77D77B753E639D1809E575F0F63B8732BB3D26051CBC24EA0BEE8400",
+        "PreservedIn":  "recovery"
+    },
+    {
+        "File":  "Bread_bot\\utils\\__pycache__\\helpers.cpython-314.pyc",
+        "SHA256":  "DC8D401CE837F21798ED268604060655E36A61B052EB75CD699891CCA41FD33D",
+        "PreservedIn":  "recovery"
+    }
+]

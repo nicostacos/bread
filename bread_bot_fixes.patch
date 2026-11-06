@@ -1,0 +1,1514 @@
+From be0db069e2af378e941ea0dc6f50f34e529f47d9 Mon Sep 17 00:00:00 2001
+From: Bread Bot Assistant <bot@example.com>
+Date: Wed, 29 Jul 2026 04:58:06 +0000
+Subject: [PATCH] Fix startup crash + dedupe bot class, implement real /apod,
+ userinfo roles/dangerous-permissions, modernize all embeds under a shared
+ palette, add warnings delete/clear-all UI, add /sendmessage formatted popup
+ tool
+
+---
+ .env.example       |   3 +
+ cogs/admin.py      |  95 ++++++------
+ cogs/moderation.py | 359 +++++++++++++++++++++++++++++++++++++--------
+ cogs/nasa.py       | 101 ++++++++++++-
+ cogs/utilities.py  | 195 ++++++++++++------------
+ config.py          |   4 +
+ events/events.py   |  27 ++--
+ main.py            |  38 +----
+ utils/database.py  |  12 +-
+ utils/embeds.py    |  64 ++++++++
+ utils/helpers.py   |  38 +++--
+ 11 files changed, 675 insertions(+), 261 deletions(-)
+ create mode 100644 utils/embeds.py
+
+diff --git a/.env.example b/.env.example
+index 4bccbe2..41d8219 100644
+--- a/.env.example
++++ b/.env.example
+@@ -4,6 +4,9 @@ DISCORD_TOKEN=your_discord_bot_token_here
+ # Bot Owner ID (optional)
+ BOT_OWNER_ID=your_user_id_here
+ 
++# NASA API key (optional, falls back to DEMO_KEY which is heavily rate-limited)
++NASA_API_KEY=your_nasa_api_key_here
++
+ # MongoDB Configuration
+ MONGO_USER=your_mongo_username
+ MONGO_PASS=your_mongo_password
+diff --git a/cogs/admin.py b/cogs/admin.py
+index 01707fb..cd412d5 100644
+--- a/cogs/admin.py
++++ b/cogs/admin.py
+@@ -13,6 +13,7 @@ from utils.config_manager import (
+     reset_filter_words, set_filter_enabled, get_filter_cache, save_automod_rule_id, load_automod_rule_id
+ )
+ from utils.helpers import send_mod_log, _queue_rejoin_invite
++from utils.embeds import make_embed, COLOR_SUCCESS, COLOR_WARNING, COLOR_ERROR, COLOR_INFO, COLOR_NEUTRAL
+ from utils.database import filter_collection
+ 
+ 
+@@ -63,12 +64,13 @@ class Admin(commands.Cog):
+             embed = discord.Embed(
+                 title="✅ Word Added to Filter",
+                 description=f"Added `{word}` to the chat filter",
+-                color=0x00FF00,
++                color=COLOR_SUCCESS,
+             )
+             embed.add_field(
+                 name="Total Filtered Words", value=str(len(current_words)), inline=True
+             )
+-            embed.set_footer(text=f"Modified by {interaction.user.name}")
++            embed.set_footer(text=f"Bread Bot • Modified by {interaction.user.name}", icon_url=interaction.user.display_avatar.url)
++            embed.timestamp = discord.utils.utcnow()
+             await interaction.response.send_message(embed=embed, ephemeral=True)
+             
+             # Attempt to update automod rule if present
+@@ -132,12 +134,13 @@ class Admin(commands.Cog):
+             embed = discord.Embed(
+                 title="🔄 Filter Reset",
+                 description="Chat filter has been reset to default settings",
+-                color=0xFF0000,
++                color=COLOR_WARNING,
+             )
+             embed.add_field(name="Previous Word Count", value=str(old_count), inline=True)
+             embed.add_field(name="New Word Count", value=str(new_count), inline=True)
+             embed.add_field(name="Status", value="Enabled", inline=True)
+-            embed.set_footer(text=f"Reset by {interaction.user.name}")
++            embed.set_footer(text=f"Bread Bot • Reset by {interaction.user.name}", icon_url=interaction.user.display_avatar.url)
++            embed.timestamp = discord.utils.utcnow()
+             await interaction.response.send_message(embed=embed, ephemeral=True)
+             
+             await set_filter_enabled(guild_id, True)
+@@ -166,7 +169,7 @@ class Admin(commands.Cog):
+             current_words = await load_filter_words(guild_id)
+             enabled = self._filter_cache[guild_id][0]
+             embed = discord.Embed(
+-                title="Chat Filter Status", color=0x00FF00 if enabled else 0xFF9900
++                title="Chat Filter Status", color=COLOR_SUCCESS if enabled else COLOR_WARNING
+             )
+             embed.add_field(
+                 name="Status", value="Enabled" if enabled else "Disabled", inline=True
+@@ -181,7 +184,8 @@ class Admin(commands.Cog):
+                 ),
+                 inline=True,
+             )
+-            embed.set_footer(text=f"Requested by {interaction.user.name}")
++            embed.set_footer(text=f"Bread Bot • Requested by {interaction.user.name}", icon_url=interaction.user.display_avatar.url)
++            embed.timestamp = discord.utils.utcnow()
+             await interaction.response.send_message(embed=embed, ephemeral=True)
+     
+     # ===== Filter Commands (Prefix) =====
+@@ -272,12 +276,13 @@ class Admin(commands.Cog):
+         embed = discord.Embed(
+             title="🔄 Filter Reset",
+             description="Chat filter has been reset to default settings",
+-            color=0xFF0000,
++            color=COLOR_WARNING,
+         )
+         embed.add_field(name="Previous Word Count", value=str(old_count), inline=True)
+         embed.add_field(name="New Word Count", value=str(new_count), inline=True)
+         embed.add_field(name="Status", value="Enabled", inline=True)
+-        embed.set_footer(text=f"Reset by {ctx.author}")
++        embed.set_footer(text=f"Bread Bot • Reset by {ctx.author}", icon_url=ctx.author.display_avatar.url)
++        embed.timestamp = discord.utils.utcnow()
+         await ctx.send(embed=embed)
+         
+         await set_filter_enabled(guild_id, True)
+@@ -307,7 +312,7 @@ class Admin(commands.Cog):
+         enabled = self._filter_cache[guild_id][0]
+         
+         embed = discord.Embed(
+-            title="Chat Filter Status", color=0x00FF00 if enabled else 0xFF9900
++            title="Chat Filter Status", color=COLOR_SUCCESS if enabled else COLOR_WARNING
+         )
+         embed.add_field(
+             name="Status", value="Enabled" if enabled else "Disabled", inline=True
+@@ -322,7 +327,8 @@ class Admin(commands.Cog):
+             ),
+             inline=True,
+         )
+-        embed.set_footer(text=f"Requested by {ctx.author}")
++        embed.set_footer(text=f"Bread Bot • Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
++        embed.timestamp = discord.utils.utcnow()
+         await ctx.send(embed=embed)
+     
+     @filter_cmd.command(name="list")
+@@ -336,8 +342,10 @@ class Admin(commands.Cog):
+             embed = discord.Embed(
+                 title="📋 Chat Filter List",
+                 description="No words are currently being filtered.",
+-                color=0x808080,
++                color=COLOR_NEUTRAL,
+             )
++            embed.set_footer(text="Bread Bot", icon_url=ctx.guild.me.display_avatar.url if ctx.guild.me else None)
++            embed.timestamp = discord.utils.utcnow()
+         else:
+             chunk_size = 20
+             chunks = [
+@@ -350,7 +358,7 @@ class Admin(commands.Cog):
+                 embed = discord.Embed(
+                     title="📋 Chat Filter List",
+                     description=f"Words {i * chunk_size + 1}-{min((i + 1) * chunk_size, len(current_words))} of {len(current_words)}",
+-                    color=0x3498DB,
++                    color=COLOR_INFO,
+                 )
+                 embed.add_field(
+                     name="Filtered Words",
+@@ -364,6 +372,11 @@ class Admin(commands.Cog):
+                     ),
+                     inline=True,
+                 )
++                embed.set_footer(
++                    text=f"Bread Bot • Page {i + 1}/{len(chunks)}",
++                    icon_url=ctx.guild.me.display_avatar.url if ctx.guild.me else None,
++                )
++                embed.timestamp = discord.utils.utcnow()
+                 embeds.append(embed)
+             
+             for embed in embeds:
+@@ -380,12 +393,13 @@ class Admin(commands.Cog):
+         embed = discord.Embed(
+             title="✅ Filter Enabled",
+             description="Chat filter has been enabled for this server.",
+-            color=0x00FF00,
++            color=COLOR_SUCCESS,
+         )
+         embed.add_field(
+             name="Filtered Words", value=str(len(current_words)), inline=True
+         )
+-        embed.set_footer(text=f"Enabled by {ctx.author}")
++        embed.set_footer(text=f"Bread Bot • Enabled by {ctx.author}", icon_url=ctx.author.display_avatar.url)
++        embed.timestamp = discord.utils.utcnow()
+         await ctx.send(embed=embed)
+         
+         # Attempt to create/update AutoMod rule
+@@ -412,7 +426,7 @@ class Admin(commands.Cog):
+         embed_disabled = discord.Embed(
+             title="⚠ Filter Disabled",
+             description="Chat filter has been disabled for this server",
+-            color=0xFF9900,
++            color=COLOR_WARNING,
+         )
+         embed_disabled.add_field(
+             name="Filtered Words", value=str(len(current_words)), inline=True
+@@ -420,7 +434,8 @@ class Admin(commands.Cog):
+         embed_disabled.add_field(
+             name="Note", value="Words are still saved, just not active", inline=False
+         )
+-        embed_disabled.set_footer(text=f"Disabled by {ctx.author}")
++        embed_disabled.set_footer(text=f"Bread Bot • Disabled by {ctx.author}", icon_url=ctx.author.display_avatar.url)
++        embed_disabled.timestamp = discord.utils.utcnow()
+         await ctx.send(embed=embed_disabled)
+         
+         # Attempt to delete AutoMod rule if present
+@@ -461,7 +476,7 @@ class Admin(commands.Cog):
+                     guild=interaction.guild,
+                     title="🔧 Log Channel Set",
+                     description="Moderation logs will now be sent to this channel.",
+-                    color=0x00FF00,
++                    color=COLOR_SUCCESS,
+                     fields=[
+                         ("Channel", channel.mention, True),
+                         ("Moderator", interaction.user.mention, True),
+@@ -493,7 +508,7 @@ class Admin(commands.Cog):
+                 guild=interaction.guild,
+                 title="🎉 Welcome Channel Set",
+                 description=f"Welcome channel set to {channel.mention} by {interaction.user.mention}",
+-                color=0x00FF00,
++                color=COLOR_SUCCESS,
+                 fields=[
+                     ("Channel", channel.mention, True),
+                     ("Moderator", interaction.user.mention, True),
+@@ -541,22 +556,15 @@ class Admin(commands.Cog):
+         try:
+             log_channel_id, welcome_channel_id = await load_config(ctx.guild.id)
+ 
+-            embed = discord.Embed(
+-                title="Channel Configuration",
++            embed = make_embed(
++                title="🔧 Channel Configuration",
+                 description=f"Current channel settings for {ctx.guild.name}",
+-                color=discord.Color.blue(),
+-            )
+-
+-            embed.add_field(
+-                name="Log Channel",
+-                value=f"<#{log_channel_id}>" if log_channel_id else "Not set",
+-                inline=False,
+-            )
+-
+-            embed.add_field(
+-                name="Welcome Channel",
+-                value=f"<#{welcome_channel_id}>" if welcome_channel_id else "Not set",
+-                inline=False,
++                color=COLOR_INFO,
++                fields=[
++                    ("Log Channel", f"<#{log_channel_id}>" if log_channel_id else "Not set", False),
++                    ("Welcome Channel", f"<#{welcome_channel_id}>" if welcome_channel_id else "Not set", False),
++                ],
++                icon=ctx.guild.me.display_avatar.url if ctx.guild.me else None,
+             )
+ 
+             await ctx.send(embed=embed)
+@@ -570,20 +578,15 @@ class Admin(commands.Cog):
+         try:
+             log_channel_id, welcome_channel_id = await load_config(interaction.guild_id)
+ 
+-            embed = discord.Embed(
+-                title="Channel Configuration",
++            embed = make_embed(
++                title="🔧 Channel Configuration",
+                 description=f"Current channel settings for {interaction.guild.name}",
+-                color=discord.Color.blue(),
+-            )
+-            embed.add_field(
+-                name="Log Channel",
+-                value=f"<#{log_channel_id}>" if log_channel_id else "Not set",
+-                inline=False,
+-            )
+-            embed.add_field(
+-                name="Welcome Channel",
+-                value=f"<#{welcome_channel_id}>" if welcome_channel_id else "Not set",
+-                inline=False,
++                color=COLOR_INFO,
++                fields=[
++                    ("Log Channel", f"<#{log_channel_id}>" if log_channel_id else "Not set", False),
++                    ("Welcome Channel", f"<#{welcome_channel_id}>" if welcome_channel_id else "Not set", False),
++                ],
++                icon=interaction.guild.me.display_avatar.url if interaction.guild.me else None,
+             )
+ 
+             await interaction.response.send_message(embed=embed, ephemeral=True)
+diff --git a/cogs/moderation.py b/cogs/moderation.py
+index bdcaf31..90a7efa 100644
+--- a/cogs/moderation.py
++++ b/cogs/moderation.py
+@@ -16,11 +16,257 @@ from utils.config_manager import (
+ )
+ from utils.helpers import (
+     is_user_blocked, add_guild_blacklist, remove_guild_blacklist, get_guild_blacklist,
+-    send_mod_log, _queue_rejoin_invite, get_member_warnings
++    send_mod_log, _queue_rejoin_invite, get_member_warnings, delete_warning, clear_warnings
+ )
++from utils.embeds import make_embed, COLOR_WARNING, COLOR_ERROR, COLOR_SUCCESS, COLOR_NEUTRAL, COLOR_BRAND
+ from utils.database import warnings_collection, moderation_cases_collection, filter_collection
+ 
+ 
++def _build_warnings_embed(guild, member, warnings):
++    """Shared embed builder for the /warnings display - used both on first
++    send and every time the button/select UI refreshes the message."""
++    embed = make_embed(
++        title=f"⚠️ Warnings for {member}",
++        description=f"Total warnings: {len(warnings)}" if warnings else "This member has no warnings.",
++        color=COLOR_WARNING if warnings else COLOR_SUCCESS,
++        thumbnail=member.display_avatar.url,
++        icon=guild.me.display_avatar.url if guild.me else None,
++    )
++
++    for warning in warnings:
++        moderator = guild.get_member(warning.get("moderator_id"))
++        moderator_name = moderator.mention if moderator else f"<@{warning.get('moderator_id')}>"
++        reason = warning.get("reason", "No reason provided")
++        evidence = warning.get("evidence", "")
++        warning_num = warning.get("warning_number", 0)
++        created_at = warning.get("created_at")
++        created_str = discord.utils.format_dt(created_at, "R") if created_at else "Unknown"
++
++        embed.add_field(
++            name=f"Warning #{warning_num}",
++            value=f"**Reason:** {reason}\n**Moderator:** {moderator_name}\n**Evidence:** {evidence if evidence else 'None'}\n**Date:** {created_str}",
++            inline=False,
++        )
++
++    return embed
++
++
++class _WarningsPermissionMixin:
++    """Shared permission gate + timeout handling for the warnings management views."""
++
++    async def interaction_check(self, interaction: discord.Interaction) -> bool:
++        if not interaction.user.guild_permissions.moderate_members:
++            await interaction.response.send_message(
++                "❌ You need Moderate Members permission to manage warnings.", ephemeral=True
++            )
++            return False
++        return True
++
++    async def on_timeout(self):
++        for item in self.children:
++            item.disabled = True
++        if self.message:
++            try:
++                await self.message.edit(view=self)
++            except discord.HTTPException:
++                pass
++
++
++class WarningDeleteSelect(discord.ui.Select):
++    """Dropdown listing each warning so a moderator can delete a specific one."""
++
++    def __init__(self, warnings):
++        options = [
++            discord.SelectOption(
++                label=f"Delete Warning #{w.get('warning_number')}",
++                description=(w.get("reason") or "No reason provided")[:100],
++                value=str(w.get("warning_number")),
++                emoji="🗑️",
++            )
++            for w in warnings[:25]  # Discord caps select menus at 25 options
++        ]
++        super().__init__(
++            placeholder="Delete a specific warning...",
++            options=options,
++            min_values=1,
++            max_values=1,
++            row=0,
++        )
++
++    async def callback(self, interaction: discord.Interaction):
++        view: WarningsView = self.view
++        warning_number = int(self.values[0])
++
++        deleted = await delete_warning(view.guild.id, view.member.id, warning_number)
++        warnings = await get_member_warnings(view.guild.id, view.member.id)
++
++        embed = _build_warnings_embed(view.guild, view.member, warnings)
++        if deleted:
++            note = f"🗑️ Warning #{warning_number} deleted. Remaining warnings have been renumbered."
++            embed.description = f"{note}\n{embed.description}" if embed.description else note
++
++        new_view = WarningsView(view.guild, view.member, warnings) if warnings else None
++        await interaction.response.edit_message(embed=embed, view=new_view)
++        if new_view:
++            new_view.message = interaction.message
++
++
++class ClearAllButton(discord.ui.Button):
++    """Kicks off the clear-all flow - swaps to a confirm/cancel view rather than
++    deleting immediately, since this is a destructive, unrecoverable action."""
++
++    def __init__(self, disabled=False):
++        super().__init__(
++            label="Clear All Warnings", style=discord.ButtonStyle.danger, emoji="🧹", row=1, disabled=disabled
++        )
++
++    async def callback(self, interaction: discord.Interaction):
++        view: WarningsView = self.view
++        confirm_view = ConfirmClearView(view.guild, view.member, view.warnings)
++        embed = make_embed(
++            title=f"⚠️ Clear all warnings for {view.member}?",
++            description=(
++                f"This permanently deletes all **{len(view.warnings)}** warning(s) for "
++                f"{view.member.mention}. This can't be undone."
++            ),
++            color=COLOR_ERROR,
++            icon=view.guild.me.display_avatar.url if view.guild.me else None,
++        )
++        await interaction.response.edit_message(embed=embed, view=confirm_view)
++        confirm_view.message = interaction.message
++
++
++class WarningsView(_WarningsPermissionMixin, discord.ui.View):
++    """Main /warnings view: a delete-select for individual warnings plus a
++    clear-all button. Only moderators (Moderate Members permission) can use it."""
++
++    def __init__(self, guild, member, warnings, *, timeout=180):
++        super().__init__(timeout=timeout)
++        self.guild = guild
++        self.member = member
++        self.warnings = warnings
++        self.message = None
++        if warnings:
++            self.add_item(WarningDeleteSelect(warnings))
++        self.add_item(ClearAllButton(disabled=not warnings))
++
++
++class ConfirmClearView(_WarningsPermissionMixin, discord.ui.View):
++    """Second step of the clear-all flow: an explicit confirm before wiping
++    every warning for a member."""
++
++    def __init__(self, guild, member, warnings, *, timeout=60):
++        super().__init__(timeout=timeout)
++        self.guild = guild
++        self.member = member
++        self.warnings = warnings
++        self.message = None
++
++    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger, emoji="✅")
++    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
++        count = await clear_warnings(self.guild.id, self.member.id)
++        embed = make_embed(
++            title=f"⚠️ Warnings for {self.member}",
++            description=f"🧹 Cleared {count} warning(s). {self.member.mention} now has no warnings.",
++            color=COLOR_SUCCESS,
++            thumbnail=self.member.display_avatar.url,
++            icon=self.guild.me.display_avatar.url if self.guild.me else None,
++        )
++        await interaction.response.edit_message(embed=embed, view=None)
++
++    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="↩️")
++    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
++        embed = _build_warnings_embed(self.guild, self.member, self.warnings)
++        new_view = WarningsView(self.guild, self.member, self.warnings)
++        await interaction.response.edit_message(embed=embed, view=new_view)
++        new_view.message = interaction.message
++
++
++class FormattedMessageModal(discord.ui.Modal, title="Compose Formatted Message"):
++    """Popup form for /sendmessage - fills in title/body/color/image/footer,
++    then posts a formatted embed to the chosen channel on submit."""
++
++    msg_title = discord.ui.TextInput(
++        label="Title",
++        placeholder="Announcement title",
++        max_length=256,
++        required=True,
++    )
++    body = discord.ui.TextInput(
++        label="Message",
++        style=discord.TextStyle.paragraph,
++        placeholder="The message body...",
++        max_length=4000,
++        required=True,
++    )
++    color_hex = discord.ui.TextInput(
++        label="Color (hex, optional)",
++        placeholder="e.g. e8a33d - leave blank for the default bread gold",
++        required=False,
++        max_length=7,
++    )
++    image_url = discord.ui.TextInput(
++        label="Image URL (optional)",
++        placeholder="https://...",
++        required=False,
++    )
++    footer_text = discord.ui.TextInput(
++        label="Footer text (optional)",
++        placeholder="Leave blank for the default footer",
++        required=False,
++        max_length=100,
++    )
++
++    def __init__(self, channel: discord.TextChannel, ping_everyone: bool):
++        super().__init__()
++        self.channel = channel
++        self.ping_everyone = ping_everyone
++
++    async def on_submit(self, interaction: discord.Interaction):
++        color = COLOR_BRAND
++        invalid_color = False
++        raw_color = (self.color_hex.value or "").strip().lstrip("#")
++        if raw_color:
++            try:
++                color = int(raw_color, 16)
++            except ValueError:
++                invalid_color = True
++
++        embed = make_embed(
++            title=str(self.msg_title),
++            description=str(self.body),
++            color=color,
++            image=self.image_url.value.strip() if self.image_url.value else None,
++            footer=self.footer_text.value.strip() if self.footer_text.value else None,
++            icon=interaction.guild.me.display_avatar.url if interaction.guild.me else None,
++        )
++
++        content = "@everyone" if self.ping_everyone else None
++
++        try:
++            sent = await self.channel.send(content=content, embed=embed)
++        except discord.Forbidden:
++            await interaction.response.send_message(
++                f"❌ I don't have permission to send messages in {self.channel.mention}.", ephemeral=True
++            )
++            return
++        except Exception as e:
++            await interaction.response.send_message(f"❌ Failed to send: {e}", ephemeral=True)
++            return
++
++        confirmation = f"✅ Sent to {self.channel.mention}. [Jump to message]({sent.jump_url})"
++        if invalid_color:
++            confirmation += f"\n⚠️ '{raw_color}' wasn't a valid hex color, used the default instead."
++        await interaction.response.send_message(confirmation, ephemeral=True)
++
++    async def on_error(self, interaction: discord.Interaction, error: Exception):
++        print(f"[ERROR] FormattedMessageModal: {error}")
++        if not interaction.response.is_done():
++            await interaction.response.send_message(
++                "❌ Something went wrong sending that message.", ephemeral=True
++            )
++
++
+ class Moderation(commands.Cog):
+     """Moderation commands"""
+     
+@@ -95,7 +341,7 @@ class Moderation(commands.Cog):
+                 guild=interaction.guild,
+                 title="👢 Member Kicked",
+                 description=f"{member.mention} has been kicked from the server.",
+-                color=0xFF9900,
++                color=COLOR_WARNING,
+                 fields=[
+                     ("User", f"{member} ({member.id})", False),
+                     ("Moderator", interaction.user.mention, True),
+@@ -166,7 +412,7 @@ class Moderation(commands.Cog):
+                     guild=interaction.guild,
+                     title="🚫 Member Banned",
+                     description=f"{member.mention} was banned by {interaction.user.mention}",
+-                    color=0xFF0000,
++                    color=COLOR_ERROR,
+                     fields=[
+                         ("Reason", reason, False),
+                         ("Evidence", evidence if evidence else "None", False),
+@@ -218,7 +464,7 @@ class Moderation(commands.Cog):
+                     guild=interaction.guild,
+                     title="🔓 Member Unbanned",
+                     description=f"{user.mention} was unbanned by {interaction.user.mention}",
+-                    color=0x00FF00,
++                    color=COLOR_SUCCESS,
+                     fields=[
+                         ("User", f"{user} ({user.id})", False),
+                         ("Moderator", interaction.user.mention, True),
+@@ -331,7 +577,7 @@ class Moderation(commands.Cog):
+                     guild=interaction.guild,
+                     title="🔇 Member Muted",
+                     description=f"{member.mention} has been muted for {duration} minutes.",
+-                    color=0xFFA500,
++                    color=COLOR_WARNING,
+                     fields=[
+                         ("User", f"{member} ({member.id})", False),
+                         ("Moderator", interaction.user.mention, True),
+@@ -387,7 +633,7 @@ class Moderation(commands.Cog):
+                     guild=interaction.guild,
+                     title="🗑️ Messages Purged",
+                     description=f"{limit} messages were purged in {interaction.channel.mention}.",
+-                    color=0x3498DB,
++                    color=COLOR_WARNING,
+                     fields=[
+                         ("Channel", interaction.channel.mention, True),
+                         ("Moderator", interaction.user.mention, True),
+@@ -448,6 +694,34 @@ class Moderation(commands.Cog):
+                 f"❌ An error occurred: {e}", ephemeral=True
+             )
+ 
++    # ===== Formatted Send-Message Tool =====
++
++    @app_commands.command(
++        name="sendmessage",
++        description="Compose a formatted announcement via a popup form and send it to a channel",
++    )
++    @app_commands.describe(
++        channel="Channel to send the message to",
++        ping_everyone="Whether to ping @everyone",
++    )
++    @app_commands.default_permissions(manage_guild=True)
++    async def sendmessage(
++        self, interaction: discord.Interaction, channel: discord.TextChannel, ping_everyone: bool = False
++    ):
++        if not interaction.user.guild_permissions.manage_guild:
++            await interaction.response.send_message(
++                "❌ You need Manage Server permission to use this!", ephemeral=True
++            )
++            return
++
++        if not channel.permissions_for(interaction.guild.me).send_messages:
++            await interaction.response.send_message(
++                f"❌ I don't have permission to send messages in {channel.mention}.", ephemeral=True
++            )
++            return
++
++        await interaction.response.send_modal(FormattedMessageModal(channel, ping_everyone))
++
+     # ===== Blacklist Commands =====
+ 
+     @app_commands.command(name="blacklist", description="Manage the server blacklist")
+@@ -504,7 +778,7 @@ class Moderation(commands.Cog):
+                     guild=interaction.guild,
+                     title="📛 User Blacklisted",
+                     description=f"{user.mention} has been added to the server blacklist.",
+-                    color=0xFF0000,
++                    color=COLOR_ERROR,
+                     fields=[
+                         ("User", f"{user} ({user.id})", False),
+                         ("Moderator", interaction.user.mention, True),
+@@ -532,7 +806,7 @@ class Moderation(commands.Cog):
+                     guild=interaction.guild,
+                     title="🗑️ User Unblacklisted",
+                     description=f"{user.mention} has been removed from the server blacklist.",
+-                    color=0x00FF00,
++                    color=COLOR_SUCCESS,
+                     fields=[
+                         ("User", f"{user} ({user.id})", False),
+                         ("Moderator", interaction.user.mention, True),
+@@ -608,7 +882,7 @@ class Moderation(commands.Cog):
+                 guild=ctx.guild,
+                 title="📛 User Blacklisted",
+                 description=f"{user.mention} has been added to the server blacklist.",
+-                color=0xFF0000,
++                color=COLOR_ERROR,
+                 fields=[
+                     ("User", f"{user} ({user.id})", False),
+                     ("Moderator", ctx.author.mention, True),
+@@ -629,7 +903,7 @@ class Moderation(commands.Cog):
+                 guild=ctx.guild,
+                 title="🗑️ User Unblacklisted",
+                 description=f"{user.mention} has been removed from the server blacklist.",
+-                color=0x00FF00,
++                color=COLOR_SUCCESS,
+                 fields=[
+                     ("User", f"{user} ({user.id})", False),
+                     ("Moderator", ctx.author.mention, True),
+@@ -726,7 +1000,7 @@ class Moderation(commands.Cog):
+                 guild=interaction.guild,
+                 title="⚠️ Member Warned",
+                 description=f"{member.mention} has received warning #{warning_number}.",
+-                color=0xFFA500,
++                color=COLOR_WARNING,
+                 fields=[
+                     ("User", f"{member} ({member.id})", False),
+                     ("Moderator", interaction.user.mention, True),
+@@ -753,7 +1027,7 @@ class Moderation(commands.Cog):
+                         guild=interaction.guild,
+                         title="👢 Auto-Kick (3 Warnings)",
+                         description=f"{member.mention} was automatically kicked after accumulating 3 warnings.",
+-                        color=0xFF9900,
++                        color=COLOR_WARNING,
+                         fields=[
+                             ("User", f"{member} ({member.id})", False),
+                             ("Action", "Automatic Kick", True),
+@@ -773,7 +1047,7 @@ class Moderation(commands.Cog):
+                         guild=interaction.guild,
+                         title="🚫 Auto-Ban (4+ Warnings)",
+                         description=f"{member.mention} was automatically banned after accumulating {warning_number} warnings.",
+-                        color=0xFF0000,
++                        color=COLOR_ERROR,
+                         fields=[
+                             ("User", f"{member} ({member.id})", False),
+                             ("Warning Count", str(warning_number), True),
+@@ -805,32 +1079,10 @@ class Moderation(commands.Cog):
+         # Sort by warning number
+         warnings.sort(key=lambda x: x.get("warning_number", 0))
+ 
+-        embed = discord.Embed(
+-            title=f"⚠️ Warnings for {member}",
+-            description=f"Total warnings: {len(warnings)}",
+-            color=0xFFA500,
+-            timestamp=discord.utils.utcnow()
+-        )
+-
+-        for warning in warnings:
+-            moderator = interaction.guild.get_member(warning.get("moderator_id"))
+-            moderator_name = moderator.mention if moderator else f"<@{warning.get('moderator_id')}>"
+-            reason = warning.get("reason", "No reason provided")
+-            evidence = warning.get("evidence", "")
+-            warning_num = warning.get("warning_number", 0)
+-            created_at = warning.get("created_at")
+-            if created_at:
+-                created_str = discord.utils.format_dt(created_at, "R")
+-            else:
+-                created_str = "Unknown"
+-
+-            embed.add_field(
+-                name=f"Warning #{warning_num}",
+-                value=f"**Reason:** {reason}\n**Moderator:** {moderator_name}\n**Evidence:** {evidence if evidence else 'None'}\n**Date:** {created_str}",
+-                inline=False
+-            )
+-
+-        await interaction.response.send_message(embed=embed, ephemeral=True)
++        embed = _build_warnings_embed(interaction.guild, member, warnings)
++        view = WarningsView(interaction.guild, member, warnings)
++        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
++        view.message = await interaction.original_response()
+ 
+     @commands.command(name="warn")
+     @commands.has_permissions(moderate_members=True)
+@@ -850,32 +1102,9 @@ class Moderation(commands.Cog):
+ 
+         warnings.sort(key=lambda x: x.get("warning_number", 0))
+ 
+-        embed = discord.Embed(
+-            title=f"⚠️ Warnings for {member}",
+-            description=f"Total warnings: {len(warnings)}",
+-            color=0xFFA500,
+-            timestamp=discord.utils.utcnow()
+-        )
+-
+-        for warning in warnings:
+-            moderator = ctx.guild.get_member(warning.get("moderator_id"))
+-            moderator_name = moderator.mention if moderator else f"<@{warning.get('moderator_id')}>"
+-            reason = warning.get("reason", "No reason provided")
+-            evidence = warning.get("evidence", "")
+-            warning_num = warning.get("warning_number", 0)
+-            created_at = warning.get("created_at")
+-            if created_at:
+-                created_str = discord.utils.format_dt(created_at, "R")
+-            else:
+-                created_str = "Unknown"
+-
+-            embed.add_field(
+-                name=f"Warning #{warning_num}",
+-                value=f"**Reason:** {reason}\n**Moderator:** {moderator_name}\n**Evidence:** {evidence if evidence else 'None'}\n**Date:** {created_str}",
+-                inline=False
+-            )
+-
+-        await ctx.send(embed=embed)
++        embed = _build_warnings_embed(ctx.guild, member, warnings)
++        view = WarningsView(ctx.guild, member, warnings)
++        view.message = await ctx.send(embed=embed, view=view)
+ 
+ 
+ async def setup(bot):
+diff --git a/cogs/nasa.py b/cogs/nasa.py
+index e2b3731..4c7668f 100644
+--- a/cogs/nasa.py
++++ b/cogs/nasa.py
+@@ -6,18 +6,107 @@ from discord import app_commands
+ from discord.ext import commands
+ import aiohttp
+ 
++from config import NASA_API_KEY
++from utils.embeds import make_embed, COLOR_INFO
++
++APOD_URL = "https://api.nasa.gov/planetary/apod"
++
++
++async def fetch_apod(bot: commands.Bot, date: str = None) -> dict:
++    """Hit the NASA APOD endpoint and return the parsed JSON.
++    Raises RuntimeError with a user-facing message on failure."""
++    params = {"api_key": NASA_API_KEY}
++    if date:
++        params["date"] = date
++
++    # Prefer the bot's shared session if it's up, otherwise open a throwaway one
++    session = getattr(bot, "aiohttp_session", None)
++    if session is None or session.closed:
++        async with aiohttp.ClientSession() as temp_session:
++            return await _do_fetch(temp_session, params)
++    return await _do_fetch(session, params)
++
++
++async def _do_fetch(session: aiohttp.ClientSession, params: dict) -> dict:
++    try:
++        async with session.get(APOD_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
++            if resp.status == 429:
++                raise RuntimeError("NASA's API is rate-limiting us right now. Try again in a bit.")
++            if resp.status != 200:
++                body = await resp.text()
++                raise RuntimeError(f"NASA API returned status {resp.status}: {body[:200]}")
++            return await resp.json()
++    except aiohttp.ClientError as e:
++        raise RuntimeError(f"Couldn't reach the NASA API: {e}")
++    except Exception as e:
++        if isinstance(e, RuntimeError):
++            raise
++        raise RuntimeError(f"Unexpected error calling NASA API: {e}")
++
++
++def build_apod_embed(data: dict) -> discord.Embed:
++    """Build a Discord embed from a NASA APOD API response."""
++    fields = []
++    if data.get("date"):
++        fields.append(("Date", data["date"], True))
++    if data.get("copyright"):
++        fields.append(("Copyright", data["copyright"].strip(), True))
++
++    media_type = data.get("media_type")
++    video_field = None
++    if media_type == "video":
++        video_field = ("Video", f"[Watch here]({data.get('url')})", False)
++
++    embed = make_embed(
++        title=data.get("title", "NASA Astronomy Picture of the Day"),
++        description=(data.get("explanation") or "")[:4096],
++        color=COLOR_INFO,
++        fields=fields,
++        url="https://apod.nasa.gov/apod/astropix.html",
++        footer="NASA Astronomy Picture of the Day",
++    )
++
++    if media_type == "image":
++        image_url = data.get("hdurl") or data.get("url")
++        if image_url:
++            embed.set_image(url=image_url)
++    elif media_type == "video":
++        embed.add_field(name=video_field[0], value=video_field[1], inline=video_field[2])
++        thumb = data.get("thumbnail_url")
++        if thumb:
++            embed.set_thumbnail(url=thumb)
++
++    return embed
++
+ 
+ class Nasa(commands.Cog):
+     """NASA-related commands"""
+-    
++
+     def __init__(self, bot):
+         self.bot = bot
+-        self.nasa_api_key = None  # Would be loaded from config
+-    
++
+     @app_commands.command(name="apod", description="Get NASA's Astronomy Picture of the Day")
+-    async def apod(self, interaction: discord.Interaction):
+-        """Get NASA's Astronomy Picture of the Day"""
+-        await interaction.response.send_message("✅ NASA APOD command works!", ephemeral=True)
++    @app_commands.describe(date="Optional date in YYYY-MM-DD format")
++    async def apod(self, interaction: discord.Interaction, date: str = None):
++        """Get NASA's Astronomy Picture of the Day (slash command)"""
++        await interaction.response.defer()
++        try:
++            data = await fetch_apod(self.bot, date)
++            embed = build_apod_embed(data)
++            await interaction.followup.send(embed=embed)
++        except RuntimeError as e:
++            await interaction.followup.send(f"❌ {e}", ephemeral=True)
++
++    @commands.command(name="apod")
++    async def apod_prefix(self, ctx, date: str = None):
++        """Get NASA's Astronomy Picture of the Day (prefix command)"""
++        async with ctx.typing():
++            try:
++                data = await fetch_apod(self.bot, date)
++                embed = build_apod_embed(data)
++                await ctx.send(embed=embed)
++            except RuntimeError as e:
++                await ctx.send(f"❌ {e}")
+ 
+ 
+ async def setup(bot):
+diff --git a/cogs/utilities.py b/cogs/utilities.py
+index 1681197..fc6b3ed 100644
+--- a/cogs/utilities.py
++++ b/cogs/utilities.py
+@@ -6,6 +6,8 @@ from discord import app_commands
+ from discord.ext import commands
+ import random
+ 
++from utils.embeds import make_embed, COLOR_SUCCESS, COLOR_ERROR, COLOR_INFO
++
+ 
+ class Utilities(commands.Cog):
+     """Utility commands"""
+@@ -35,10 +37,11 @@ class Utilities(commands.Cog):
+         result = random.choice(["Heads", "Tails"])
+         emoji = "👑" if result == "Heads" else "🔢"
+ 
+-        embed = discord.Embed(
++        embed = make_embed(
+             title="🪙 Coin Toss",
+             description=f"{emoji} **{result}**!",
+-            color=0x00FF00 if result == "Heads" else 0xFF0000,
++            color=COLOR_SUCCESS if result == "Heads" else COLOR_ERROR,
++            icon=interaction.guild.me.display_avatar.url if interaction.guild and interaction.guild.me else None,
+         )
+         await interaction.response.send_message(embed=embed)
+ 
+@@ -47,24 +50,23 @@ class Utilities(commands.Cog):
+     @app_commands.command(name="botinfo", description="Get information about the bot")
+     async def botinfo(self, interaction: discord.Interaction):
+         """Get information about the bot"""
+-        embed = discord.Embed(
++        embed = make_embed(
+             title="🤖 Bot Information",
+             description="Bread Bot - A multi-purpose Discord bot for moderation, utilities, and fun!",
+-            color=0xFFA500,
+-            timestamp=discord.utils.utcnow()
++            color=COLOR_INFO,
++            fields=[
++                ("Name", self.bot.user.name, True),
++                ("ID", str(self.bot.user.id), True),
++                ("Prefix", "`bread`", True),
++                ("Created", discord.utils.format_dt(self.bot.user.created_at, "D"), False),
++                ("Servers", str(len(self.bot.guilds)), True),
++                ("Users", str(len(set(m.id for m in self.bot.get_all_members()))), True),
++                ("Latency", f"{round(self.bot.latency * 1000)}ms", True),
++            ],
++            thumbnail=self.bot.user.avatar.url if self.bot.user.avatar else None,
++            icon=self.bot.user.avatar.url if self.bot.user.avatar else None,
+         )
+         
+-        embed.add_field(name="Name", value=self.bot.user.name, inline=True)
+-        embed.add_field(name="ID", value=str(self.bot.user.id), inline=True)
+-        embed.add_field(name="Prefix", value="`bread`", inline=True)
+-        embed.add_field(name="Created", value=discord.utils.format_dt(self.bot.user.created_at, "D"), inline=False)
+-        embed.add_field(name="Servers", value=str(len(self.bot.guilds)), inline=True)
+-        embed.add_field(name="Users", value=str(len(set(m.id for m in self.bot.get_all_members()))), inline=True)
+-        embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)}ms", inline=True)
+-        
+-        if self.bot.user.avatar:
+-            embed.set_thumbnail(url=self.bot.user.avatar.url)
+-        
+         await interaction.response.send_message(embed=embed)
+ 
+     @app_commands.command(name="serverinfo", description="Get information about the server")
+@@ -75,28 +77,49 @@ class Utilities(commands.Cog):
+             return
+         
+         guild = interaction.guild
+-        embed = discord.Embed(
++        embed = make_embed(
+             title="🏢 Server Information",
+             description=f"Information about **{guild.name}**",
+-            color=0x3498DB,
+-            timestamp=discord.utils.utcnow()
++            color=COLOR_INFO,
++            fields=[
++                ("Name", guild.name, True),
++                ("ID", str(guild.id), True),
++                ("Owner", guild.owner.mention, True),
++                ("Created", discord.utils.format_dt(guild.created_at, "D"), False),
++                ("Members", str(guild.member_count), True),
++                ("Text Channels", str(len(guild.text_channels)), True),
++                ("Voice Channels", str(len(guild.voice_channels)), True),
++                ("Roles", str(len(guild.roles)), True),
++                ("Emojis", str(len(guild.emojis)), True),
++            ],
++            thumbnail=guild.icon.url if guild.icon else None,
++            icon=self.bot.user.avatar.url if self.bot.user.avatar else None,
+         )
+         
+-        embed.add_field(name="Name", value=guild.name, inline=True)
+-        embed.add_field(name="ID", value=str(guild.id), inline=True)
+-        embed.add_field(name="Owner", value=guild.owner.mention, inline=True)
+-        embed.add_field(name="Created", value=discord.utils.format_dt(guild.created_at, "D"), inline=False)
+-        embed.add_field(name="Members", value=str(guild.member_count), inline=True)
+-        embed.add_field(name="Text Channels", value=str(len(guild.text_channels)), inline=True)
+-        embed.add_field(name="Voice Channels", value=str(len(guild.voice_channels)), inline=True)
+-        embed.add_field(name="Roles", value=str(len(guild.roles)), inline=True)
+-        embed.add_field(name="Emojis", value=str(len(guild.emojis)), inline=True)
+-        
+-        if guild.icon:
+-            embed.set_thumbnail(url=guild.icon.url)
+-        
+         await interaction.response.send_message(embed=embed)
+ 
++    # Permissions worth flagging on a user - anything that can meaningfully
++    # affect the server, other members, or the bot's own security.
++    DANGEROUS_PERMISSIONS = [
++        "administrator",
++        "manage_guild",
++        "manage_roles",
++        "manage_channels",
++        "manage_webhooks",
++        "manage_emojis",
++        "manage_messages",
++        "manage_nicknames",
++        "manage_threads",
++        "manage_events",
++        "kick_members",
++        "ban_members",
++        "moderate_members",  # timeout
++        "mention_everyone",
++        "mute_members",
++        "deafen_members",
++        "move_members",
++    ]
++
+     @app_commands.command(name="userinfo", description="Get information about a user")
+     @app_commands.describe(user="The user to get information about (default: you)")
+     async def userinfo(self, interaction: discord.Interaction, user: discord.User = None):
+@@ -104,11 +127,11 @@ class Utilities(commands.Cog):
+         user = user or interaction.user
+         member = interaction.guild.get_member(user.id) if interaction.guild else None
+         
+-        embed = discord.Embed(
++        embed = make_embed(
+             title="👤 User Information",
+             description=f"Information about {user.mention}",
+-            color=0x9B59B6,
+-            timestamp=discord.utils.utcnow()
++            color=COLOR_INFO,
++            icon=self.bot.user.avatar.url if self.bot.user.avatar else None,
+         )
+         
+         embed.add_field(name="Name", value=str(user), inline=True)
+@@ -117,9 +140,33 @@ class Utilities(commands.Cog):
+         
+         if member:
+             embed.add_field(name="Joined Server", value=discord.utils.format_dt(member.joined_at, "D"), inline=False)
+-            embed.add_field(name="Roles", value=str(len(member.roles) - 1), inline=True)  # -1 to exclude @everyone
++
++            # Roles (exclude @everyone, highest first)
++            roles = [r for r in member.roles if r.name != "@everyone"]
++            roles.sort(key=lambda r: r.position, reverse=True)
++            if roles:
++                roles_value = ", ".join(r.mention for r in roles)
++                if len(roles_value) > 1024:
++                    roles_value = roles_value[:1000] + "... (truncated)"
++            else:
++                roles_value = "None"
++            embed.add_field(name=f"Roles ({len(roles)})", value=roles_value, inline=False)
++
+             embed.add_field(name="Highest Role", value=member.top_role.mention, inline=True)
+             embed.add_field(name="Bot", value="Yes" if user.bot else "No", inline=True)
++
++            # Dangerous permissions this member holds (via any role)
++            perms = member.guild_permissions
++            flagged = [
++                perm.replace("_", " ").title()
++                for perm in self.DANGEROUS_PERMISSIONS
++                if getattr(perms, perm, False)
++            ]
++            embed.add_field(
++                name=f"⚠️ Dangerous Permissions ({len(flagged)})",
++                value=", ".join(flagged) if flagged else "None",
++                inline=False,
++            )
+         
+         if user.avatar:
+             embed.set_thumbnail(url=user.avatar.url)
+@@ -131,71 +178,39 @@ class Utilities(commands.Cog):
+     @commands.command(name="help")
+     async def help_command(self, ctx):
+         """Show help information (prefix command)"""
+-        embed = discord.Embed(
++        embed = make_embed(
+             title="📖 Bread Bot Help",
+             description="List of available commands",
+-            color=0x3498DB,
+-            timestamp=discord.utils.utcnow()
+-        )
+-        
+-        embed.add_field(
+-            name="🔧 Utility Commands",
+-            value="`test`, `ping`, `hello`, `coin_toss`, `botinfo`, `serverinfo`, `userinfo`",
+-            inline=False
+-        )
+-        embed.add_field(
+-            name="🛡️ Moderation Commands",
+-            value="`kick`, `ban`, `unban`, `mute`, `purge`, `broadcast`, `blacklist`, `warn`, `warnings`",
+-            inline=False
++            color=COLOR_INFO,
++            fields=[
++                ("🔧 Utility Commands", "`test`, `ping`, `hello`, `coin_toss`, `botinfo`, `serverinfo`, `userinfo`", False),
++                ("🛡️ Moderation Commands", "`kick`, `ban`, `unban`, `mute`, `purge`, `broadcast`, `blacklist`, `warn`, `warnings`", False),
++                ("⚙️ Admin Commands", "`setlog`, `setwelcome`, `getchannels`, `filter`, `automod`", False),
++                ("💡 Usage", "Use `/` for slash commands or `bread ` for prefix commands", False),
++            ],
++            thumbnail=self.bot.user.avatar.url if self.bot.user.avatar else None,
++            icon=self.bot.user.avatar.url if self.bot.user.avatar else None,
++            footer="Bread Bot - Your friendly neighborhood bot!",
+         )
+-        embed.add_field(
+-            name="⚙️ Admin Commands",
+-            value="`setlog`, `setwelcome`, `getchannels`, `filter`, `automod`",
+-            inline=False
+-        )
+-        
+-        embed.add_field(
+-            name="💡 Usage",
+-            value="Use `/` for slash commands or `bread ` for prefix commands",
+-            inline=False
+-        )
+-        
+-        embed.set_footer(text="Bread Bot - Your friendly neighborhood bot!")
+         await ctx.send(embed=embed)
+ 
+     @app_commands.command(name="help", description="Show help information")
+     async def slash_help(self, interaction: discord.Interaction):
+         """Show help information (slash command)"""
+-        embed = discord.Embed(
++        embed = make_embed(
+             title="📖 Bread Bot Help",
+             description="List of available commands",
+-            color=0x3498DB,
+-            timestamp=discord.utils.utcnow()
+-        )
+-        
+-        embed.add_field(
+-            name="🔧 Utility Commands",
+-            value="/test, /ping, /hello, /coin_toss, /botinfo, /serverinfo, /userinfo",
+-            inline=False
++            color=COLOR_INFO,
++            fields=[
++                ("🔧 Utility Commands", "/test, /ping, /hello, /coin_toss, /botinfo, /serverinfo, /userinfo", False),
++                ("🛡️ Moderation Commands", "/kick, /ban, /unban, /mute, /purge, /broadcast, /blacklist, /warn, /warnings", False),
++                ("⚙️ Admin Commands", "/setlog, /setwelcome, /getchannels, /filter, /automod", False),
++                ("💡 Usage", "Use `/` for slash commands or `bread ` for prefix commands", False),
++            ],
++            thumbnail=self.bot.user.avatar.url if self.bot.user.avatar else None,
++            icon=self.bot.user.avatar.url if self.bot.user.avatar else None,
++            footer="Bread Bot - Your friendly neighborhood bot!",
+         )
+-        embed.add_field(
+-            name="🛡️ Moderation Commands",
+-            value="/kick, /ban, /unban, /mute, /purge, /broadcast, /blacklist, /warn, /warnings",
+-            inline=False
+-        )
+-        embed.add_field(
+-            name="⚙️ Admin Commands",
+-            value="/setlog, /setwelcome, /getchannels, /filter, /automod",
+-            inline=False
+-        )
+-        
+-        embed.add_field(
+-            name="💡 Usage",
+-            value="Use `/` for slash commands or `bread ` for prefix commands",
+-            inline=False
+-        )
+-        
+-        embed.set_footer(text="Bread Bot - Your friendly neighborhood bot!")
+         await interaction.response.send_message(embed=embed)
+ 
+ 
+diff --git a/config.py b/config.py
+index 20cb4de..e07e7de 100644
+--- a/config.py
++++ b/config.py
+@@ -20,6 +20,10 @@ MONGO_URI = f"mongodb+srv://{MONGO_USER}:{MONGO_PASS}@{MONGO_HOST}/{MONGO_DB}?re
+ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+ BOT_OWNER_ID = os.getenv("BOT_OWNER_ID")
+ 
++# NASA API Configuration
++# Get a free key at https://api.nasa.gov/ (DEMO_KEY works but has a very low rate limit)
++NASA_API_KEY = os.getenv("NASA_API_KEY", "DEMO_KEY")
++
+ # Channel IDs
+ LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
+ WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID")
+diff --git a/events/events.py b/events/events.py
+index c1b8273..f897075 100644
+--- a/events/events.py
++++ b/events/events.py
+@@ -4,11 +4,13 @@ Discord bot event handlers
+ import discord
+ from discord.ext import commands
+ import asyncio
++import aiohttp
+ import re
+ from config import PING_URL, TIME_ID, DEFAULT_FILTER_WORDS, BLACKLIST_BLOCK_MESSAGE, GLOBAL_BLACKLIST
+ from utils.config_manager import load_config, load_filter_words, get_filter_cache
+ from utils.helpers import is_user_blocked, send_mod_log, _queue_rejoin_invite
+ from utils.database import scheduled_invites_collection, warnings_collection
++from utils.embeds import COLOR_ERROR
+ 
+ 
+ async def on_guild_remove(guild):
+@@ -49,7 +51,7 @@ async def global_prefix_block_check(ctx):
+                     guild=ctx.guild,
+                     title="\u26d4 Blocked Command Attempt",
+                     description=f"{ctx.author.mention} attempted to use `{command_name}` but was blocked.",
+-                    color=0xFF0000,
++                    color=COLOR_ERROR,
+                     fields=[
+                         ("User", f"{ctx.author} ({ctx.author.id})", False),
+                         ("Command", f"`{command_name}`", True),
+@@ -83,7 +85,7 @@ async def global_slash_block_check(interaction: discord.Interaction):
+                     guild=interaction.guild,
+                     title="\u26d4 Blocked Slash Command Attempt",
+                     description=f"{interaction.user.mention} attempted to use `/{command_name}` but was blocked.",
+-                    color=0xFF0000,
++                    color=COLOR_ERROR,
+                     fields=[
+                         ("User", f"{interaction.user} ({interaction.user.id})", False),
+                         ("Command", f"/{command_name}", True),
+@@ -194,12 +196,13 @@ async def on_message(bot, message):
+             if matches:
+                 try:
+                     await message.delete()
+-                    embed = discord.Embed(
++                    from utils.embeds import make_embed, COLOR_ERROR
++                    embed = make_embed(
+                         title="\ud83d\udeab Message Filtered",
+                         description=f"Your message contained forbidden words: {', '.join(set(matches))}",
+-                        color=0xFF0000,
++                        color=COLOR_ERROR,
++                        fields=[("Note", "Repeated offenses may result in a kick or ban.", False)],
+                     )
+-                    embed.add_field(name="Note", value="Repeated offenses may result in a kick or ban.", inline=False)
+                     try:
+                         await message.author.send(embed=embed)
+                     except discord.Forbidden:
+@@ -209,7 +212,7 @@ async def on_message(bot, message):
+                         guild=message.guild,
+                         title="\ud83d\udeab Message Filtered",
+                         description=f"{message.author.mention}'s message was filtered.",
+-                        color=0xFF0000,
++                        color=COLOR_ERROR,
+                         fields=[
+                             ("User", f"{message.author} ({message.author.id})", False),
+                             ("Channel", message.channel.mention, True),
+@@ -231,13 +234,15 @@ async def on_member_join(bot, member):
+         if welcome_channel_id:
+             channel = member.guild.get_channel(welcome_channel_id)
+             if channel:
+-                embed = discord.Embed(
+-                    title="Welcome!",
++                from utils.embeds import make_embed, COLOR_SUCCESS
++                embed = make_embed(
++                    title="🎉 Welcome!",
+                     description=f"{member.mention} has joined the server!",
+-                    color=discord.Color.green(),
++                    color=COLOR_SUCCESS,
++                    fields=[("Member Count", str(member.guild.member_count), True)],
++                    thumbnail=member.display_avatar.url,
++                    icon=member.guild.me.display_avatar.url if member.guild.me else None,
+                 )
+-                if member.avatar:
+-                    embed.set_thumbnail(url=member.avatar.url)
+                 await channel.send(embed=embed)
+     except Exception as e:
+         print(f"Failed to send DM to {member.name}: {e}")
+diff --git a/main.py b/main.py
+index 0b211f4..9f3cc98 100644
+--- a/main.py
++++ b/main.py
+@@ -41,11 +41,13 @@ class BreadBot(commands.Bot):
+         self.background_task = asyncio.create_task(keep_alive_task(self))
+         self.scheduled_invite_task = asyncio.create_task(process_scheduled_invites(self))
+         
+-        # Call events setup_hook
++        # Call events setup_hook (registers slash-command blacklist check, DB indexes)
+         await events_setup_hook(self)
+         
+         print("Syncing application commands...")
+         await self.tree.sync()
++        
++        print("Bot setup complete!")
+ 
+ 
+ def run_flask():
+@@ -94,26 +96,6 @@ intents.message_content = True
+ intents.members = True
+ 
+ 
+-class BreadBot(commands.Bot):
+-    """Custom bot class with setup hook"""
+-    
+-    async def setup_hook(self):
+-        """Setup hook for bot initialization"""
+-        from events.events import (
+-            on_message, on_member_join,
+-            setup_hook as events_setup_hook
+-        )
+-        
+-        # Call events setup_hook
+-        await events_setup_hook(self)
+-        
+-        # Register event listeners
+-        self.add_listener(on_message, "on_message")
+-        self.add_listener(on_member_join, "on_member_join")
+-        
+-        print("Bot setup complete!")
+-
+-
+ # Initialize bot
+ bot = BreadBot(command_prefix="bread ", intents=intents, help_command=None)
+ 
+@@ -159,11 +141,6 @@ async def on_ready():
+     print(f"We are ready to go in, {bot.user.name}")
+     print(f"Bot ID: {bot.user.id}")
+     
+-    # Start background tasks after bot is ready
+-    from events.events import keep_alive_task, process_scheduled_invites
+-    bot.background_task = asyncio.create_task(keep_alive_task(bot))
+-    bot.scheduled_invite_task = asyncio.create_task(process_scheduled_invites(bot))
+-    
+     try:
+         from utils.database import check_mongodb_connection, debug_db
+         await check_mongodb_connection()
+@@ -231,12 +208,13 @@ async def on_message(message):
+             if matches:
+                 try:
+                     await message.delete()
+-                    embed = discord.Embed(
++                    from utils.embeds import make_embed, COLOR_ERROR
++                    embed = make_embed(
+                         title="🚫 Message Filtered",
+                         description=f"Your message contained forbidden words: {', '.join(set(matches))}",
+-                        color=0xFF0000,
++                        color=COLOR_ERROR,
++                        fields=[("Note", "Repeated offenses may result in a kick or ban.", False)],
+                     )
+-                    embed.add_field(name="Note", value="Repeated offenses may result in a kick or ban.", inline=False)
+                     try:
+                         await message.author.send(embed=embed)
+                     except discord.Forbidden:
+@@ -246,7 +224,7 @@ async def on_message(message):
+                         guild=message.guild,
+                         title="🚫 Message Filtered",
+                         description=f"{message.author.mention}'s message was filtered.",
+-                        color=0xFF0000,
++                        color=COLOR_ERROR,
+                         fields=[
+                             ("User", f"{message.author} ({message.author.id})", False),
+                             ("Channel", message.channel.mention, True),
+diff --git a/utils/database.py b/utils/database.py
+index c5f39d4..4e2aedd 100644
+--- a/utils/database.py
++++ b/utils/database.py
+@@ -21,6 +21,12 @@ else:
+     # Create dummy objects if no database configured
+     print("[WARN] MongoDB not configured - using dummy database objects")
+     
++    class DummyResult:
++        """Mimics pymongo's UpdateResult/DeleteResult attribute access on dummy responses."""
++        def __init__(self, **kwargs):
++            for key, value in kwargs.items():
++                setattr(self, key, value)
++
+     class DummyCollection:
+         async def insert_one(self, *args, **kwargs):
+             return {"inserted_id": None}
+@@ -32,13 +38,13 @@ else:
+             return DummyCursor()
+         
+         async def delete_one(self, *args, **kwargs):
+-            return {"deleted_count": 0}
++            return DummyResult(deleted_count=0)
+         
+         async def delete_many(self, *args, **kwargs):
+-            return {"deleted_count": 0}
++            return DummyResult(deleted_count=0)
+         
+         async def update_one(self, *args, **kwargs):
+-            return {"modified_count": 0}
++            return DummyResult(modified_count=0)
+         
+         async def create_index(self, *args, **kwargs):
+             return None
+diff --git a/utils/embeds.py b/utils/embeds.py
+new file mode 100644
+index 0000000..0d766d2
+--- /dev/null
++++ b/utils/embeds.py
+@@ -0,0 +1,64 @@
++"""
++Shared embed styling for Bread Bot.
++
++Every embed the bot sends should pull its color from the palette below and
++go through make_embed() so titles, footers, and timestamps stay consistent
++no matter which cog is sending it. Don't hardcode hex colors at call sites.
++"""
++import discord
++
++# ===== Color palette =====
++# Semantic, not per-command - pick based on what the embed communicates,
++# not which command happens to send it.
++COLOR_SUCCESS = 0x57F287   # positive/completed outcomes: unban, config saved, filter on
++COLOR_ERROR = 0xED4245     # bans, blocked actions, filtered messages, failures
++COLOR_WARNING = 0xF5A623   # mutes, warnings, purges, disabled states, kicks
++COLOR_INFO = 0x5865F2      # lookups: userinfo, serverinfo, botinfo, help, apod
++COLOR_NEUTRAL = 0x99AAB5   # low-stakes notices, "nothing to show" states
++COLOR_BRAND = 0xE8A33D     # bot-identity moments: welcome messages, fun/misc
++
++FOOTER_TEXT = "Bread Bot"
++
++
++def make_embed(
++    *,
++    title=None,
++    description=None,
++    color=COLOR_INFO,
++    fields=None,
++    thumbnail=None,
++    image=None,
++    url=None,
++    author=None,
++    author_icon=None,
++    icon=None,
++    footer=None,
++    timestamp=True,
++):
++    """Build a Discord embed with the bot's standard look.
++
++    fields: list of (name, value, inline) tuples.
++    icon: url to use as the footer icon (usually guild.me.display_avatar.url
++        or bot.user.display_avatar.url) - keeps the footer branded without
++        every call site having to build that string itself.
++    Always stamps a timestamp and a consistent footer unless overridden.
++    """
++    embed = discord.Embed(title=title, description=description, color=color, url=url)
++
++    if timestamp:
++        embed.timestamp = discord.utils.utcnow()
++
++    for field in fields or []:
++        name, value, inline = field
++        embed.add_field(name=name, value=value, inline=inline)
++
++    if thumbnail:
++        embed.set_thumbnail(url=thumbnail)
++    if image:
++        embed.set_image(url=image)
++    if author:
++        embed.set_author(name=author, icon_url=author_icon)
++
++    embed.set_footer(text=footer or FOOTER_TEXT, icon_url=icon)
++
++    return embed
+diff --git a/utils/helpers.py b/utils/helpers.py
+index 621687c..0434a8e 100644
+--- a/utils/helpers.py
++++ b/utils/helpers.py
+@@ -66,9 +66,29 @@ async def get_member_warnings(guild_id, user_id):
+     return warnings
+ 
+ 
++async def delete_warning(guild_id, user_id, warning_number):
++    """Delete a single warning by its current (position-based) number.
++    Numbers are recomputed from position every call, so deleting one
++    automatically renumbers whatever's left - no separate renumber step needed.
++    Returns True if something was deleted, False if that number didn't exist."""
++    warnings = await get_member_warnings(guild_id, user_id)
++    target = next((w for w in warnings if w.get("warning_number") == warning_number), None)
++    if not target:
++        return False
++    result = await warnings_collection.delete_one({"_id": target["_id"]})
++    return result.deleted_count > 0
++
++
++async def clear_warnings(guild_id, user_id):
++    """Delete every warning for a member. Returns the number deleted."""
++    result = await warnings_collection.delete_many({"guild_id": guild_id, "user_id": user_id})
++    return result.deleted_count
++
++
+ async def send_mod_log(guild, title, description, color, fields=None, thumbnail=None):
+     """Send a moderation log message to the configured log channel"""
+     from utils.config_manager import load_config  # Import here to avoid circular dependency
++    from utils.embeds import make_embed
+     try:
+         log_channel_id, _ = await load_config(guild.id)
+         if not log_channel_id:
+@@ -78,20 +98,17 @@ async def send_mod_log(guild, title, description, color, fields=None, thumbnail=
+         if not channel:
+             return
+         
+-        embed = discord.Embed(
++        icon = guild.me.display_avatar.url if guild.me else None
++        embed = make_embed(
+             title=title,
+             description=description,
+             color=color,
+-            timestamp=discord.utils.utcnow()
++            fields=fields,
++            thumbnail=thumbnail,
++            footer="Bread Bot - Mod Log",
++            icon=icon,
+         )
+         
+-        if fields:
+-            for name, value, inline in fields:
+-                embed.add_field(name=name, value=value, inline=inline)
+-        
+-        if thumbnail:
+-            embed.set_thumbnail(url=thumbnail)
+-        
+         await channel.send(embed=embed)
+     except Exception as e:
+         print(f"[ERROR] send_mod_log: {e}")
+@@ -117,8 +134,9 @@ async def log_moderation_case(guild, member, moderator, action, reason, evidence
+         "duration": duration_label, "created_at": discord.utils.utcnow(),
+     })
+     
++    from utils.embeds import COLOR_ERROR
+     past_tense = {"ban": "banned", "kick": "kicked", "timeout": "timed out"}.get(action, action)
+-    await send_mod_log(guild, f"{action.title()} issued", f"{member.mention} was {past_tense}.", 0xE74C3C,
++    await send_mod_log(guild, f"{action.title()} issued", f"{member.mention} was {past_tense}.", COLOR_ERROR,
+         [("Moderator", moderator.mention, True), ("Reason", reason, False),
+          ("Evidence", evidence, False), ("Duration", duration_label, True),
+          ("DM delivered", "Yes" if dm_sent else "No / not required", True)],
+-- 
+2.43.0
+

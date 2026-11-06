@@ -2,3 +2,6 @@
 discord.log
 __pycache__/
 *.pyc
+backups/
+.venv/
+logs/
